@@ -1,0 +1,18 @@
+﻿
+Length Name         
+------ ----         
+192068 app.rs       
+ 18055 project.rs   
+ 12655 config.rs    
+  9786 llm.rs       
+  8333 state_sync.rs
+  6056 theme.rs     
+  4539 history.rs   
+  3226 fonts.rs     
+  2909 vendors.rs   
+  2902 audit_log.rs 
+  2596 oplog.rs     
+  1990 chapter_md.rs
+   798 main.rs      
+
+

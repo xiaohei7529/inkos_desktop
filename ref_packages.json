@@ -1,0 +1,50 @@
+[
+    {
+        "name": "cli",
+        "path": "packages/cli",
+        "sha": "476b40004df3bec106f1ba232da0db23fe3022de",
+        "size": 0,
+        "url": "https://api.github.com/repos/Narcooo/inkos/contents/packages/cli?ref=master",
+        "html_url": "https://github.com/Narcooo/inkos/tree/master/packages/cli",
+        "git_url": "https://api.github.com/repos/Narcooo/inkos/git/trees/476b40004df3bec106f1ba232da0db23fe3022de",
+        "download_url": null,
+        "type": "dir",
+        "_links": {
+            "self": "https://api.github.com/repos/Narcooo/inkos/contents/packages/cli?ref=master",
+            "git": "https://api.github.com/repos/Narcooo/inkos/git/trees/476b40004df3bec106f1ba232da0db23fe3022de",
+            "html": "https://github.com/Narcooo/inkos/tree/master/packages/cli"
+        }
+    },
+    {
+        "name": "core",
+        "path": "packages/core",
+        "sha": "d227c5744ac09dfc74bb298dab052f87465a22df",
+        "size": 0,
+        "url": "https://api.github.com/repos/Narcooo/inkos/contents/packages/core?ref=master",
+        "html_url": "https://github.com/Narcooo/inkos/tree/master/packages/core",
+        "git_url": "https://api.github.com/repos/Narcooo/inkos/git/trees/d227c5744ac09dfc74bb298dab052f87465a22df",
+        "download_url": null,
+        "type": "dir",
+        "_links": {
+            "self": "https://api.github.com/repos/Narcooo/inkos/contents/packages/core?ref=master",
+            "git": "https://api.github.com/repos/Narcooo/inkos/git/trees/d227c5744ac09dfc74bb298dab052f87465a22df",
+            "html": "https://github.com/Narcooo/inkos/tree/master/packages/core"
+        }
+    },
+    {
+        "name": "studio",
+        "path": "packages/studio",
+        "sha": "74bb46227183d4fe0670197981befe655379e9ed",
+        "size": 0,
+        "url": "https://api.github.com/repos/Narcooo/inkos/contents/packages/studio?ref=master",
+        "html_url": "https://github.com/Narcooo/inkos/tree/master/packages/studio",
+        "git_url": "https://api.github.com/repos/Narcooo/inkos/git/trees/74bb46227183d4fe0670197981befe655379e9ed",
+        "download_url": null,
+        "type": "dir",
+        "_links": {
+            "self": "https://api.github.com/repos/Narcooo/inkos/contents/packages/studio?ref=master",
+            "git": "https://api.github.com/repos/Narcooo/inkos/git/trees/74bb46227183d4fe0670197981befe655379e9ed",
+            "html": "https://github.com/Narcooo/inkos/tree/master/packages/studio"
+        }
+    }
+]
