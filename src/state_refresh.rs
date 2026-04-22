@@ -1,7 +1,7 @@
 //! AI 刷新 `story_state/` 档案（对齐 inkoswin `build_state_document_prompts` + `_state_documents_worker`）。
 //!
 //! - `chapter_summaries.md`：仅本地 `build_chapter_summaries_document` 重建，不调 LLM。
-//! - `book_rules.md`：不参与批量刷新（硬约束由用户或专用「AI 生成」维护）。
+//! - `book_rules.md`：默认不参与批量刷新（首章收尾可按业务侧策略单独触发）。
 
 use std::collections::HashMap;
 
@@ -20,6 +20,27 @@ pub const STATE_DIR_FILENAMES: &[&str] = &[
     "character_matrix.md",
 ];
 
+/// `story/` 下纳入治理层刷新的文件。
+pub const STORY_CONTROL_FILENAMES: &[&str] = &[
+    "story/author_intent.md",
+    "story/current_focus.md",
+];
+
+/// 构造「其他状态文件摘要」时会参考的文件（含 `story_state/` + `story/`）。
+pub const RELATED_CONTEXT_FILENAMES: &[&str] = &[
+    "book_rules.md",
+    "current_state.md",
+    "particle_ledger.md",
+    "pending_hooks.md",
+    "chapter_summaries.md",
+    "novel_brief.md",
+    "subplot_board.md",
+    "emotional_arcs.md",
+    "character_matrix.md",
+    "story/author_intent.md",
+    "story/current_focus.md",
+];
+
 /// 与 inkoswin `STATE_FILE_SPECS` 顺序一致；不含 `book_rules.md`。
 pub const REFRESH_ALL_ORDER: &[&str] = &[
     "current_state.md",
@@ -30,6 +51,8 @@ pub const REFRESH_ALL_ORDER: &[&str] = &[
     "subplot_board.md",
     "emotional_arcs.md",
     "character_matrix.md",
+    "story/author_intent.md",
+    "story/current_focus.md",
 ];
 
 #[derive(Debug, Clone)]
@@ -89,6 +112,18 @@ const SPECS: &[StateFileSpec] = &[
         description: "相遇记录、信息边界",
         ai_guidance: "记录角色相遇、交互张力、彼此掌握的信息差，以及关系演化方向。",
     },
+    StateFileSpec {
+        filename: "story/author_intent.md",
+        title: "作者长期意图",
+        description: "长期叙事方向、主题承诺、创作边界与不变核心",
+        ai_guidance: "聚焦整本书的长期目标与边界，保持抽象稳定，不写具体剧情流水账。",
+    },
+    StateFileSpec {
+        filename: "story/current_focus.md",
+        title: "当前焦点（近 1-3 章）",
+        description: "近期章节重点推进目标、关键冲突、情绪与节奏控制",
+        ai_guidance: "只保留近 1-3 章可执行焦点，突出短期推进任务与风险，避免发散。",
+    },
 ];
 
 pub fn spec_for(filename: &str) -> Option<&'static StateFileSpec> {
@@ -138,7 +173,7 @@ pub fn build_state_document_prompts(
 不要写空话，不要重复模板说明，只输出该文件最终内容。";
 
     let mut related_context: Vec<String> = Vec::new();
-    for filename in STATE_DIR_FILENAMES {
+    for filename in RELATED_CONTEXT_FILENAMES {
         if *filename == spec.filename {
             continue;
         }

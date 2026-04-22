@@ -254,6 +254,8 @@ pub struct InkOsApp {
     book_rules_gen_task: Option<LlmTask>,
     /// 若 `book_rules.md` 已被编辑过、再次触发生成时弹覆盖确认。
     pending_book_rules_confirm: bool,
+    /// 手动/下一章生成在第 1 章完成后，等待用户保存时追加一次 book_rules 同步刷新。
+    pending_book_rules_sync_on_save: bool,
 
     /// AI 刷新状态档案（当前文件 / 全部文件）；结果直接落盘，章节仍由用户手动保存。
     state_refresh_task: Option<LlmTask>,
@@ -411,6 +413,7 @@ impl InkOsApp {
             pending_gen_confirm: None,
             book_rules_gen_task: None,
             pending_book_rules_confirm: false,
+            pending_book_rules_sync_on_save: false,
             state_refresh_task: None,
             state_refresh_batch: None,
             pending_next_chapter_after_refresh: false,
@@ -522,6 +525,7 @@ impl InkOsApp {
         self.pending_gen_confirm = None;
         self.book_rules_gen_task = None;
         self.pending_book_rules_confirm = false;
+        self.pending_book_rules_sync_on_save = false;
         self.state_refresh_task = None;
         self.state_refresh_batch = None;
         self.pending_next_chapter_after_refresh = false;
@@ -714,7 +718,11 @@ impl InkOsApp {
                 // 保存成功后自动同步「长期记忆档案」（对齐 inkoswin 的连续性前提）。
                 // 否则 [连续性档案] 会滞后于实际章节推进，导致「生成下一章」与前文对不上。
                 if self.settings.auto_refresh_state_after_chapter_save {
-                    self.auto_refresh_state_after_chapter_saved(n);
+                    self.auto_refresh_state_after_chapter_saved(n, false);
+                }
+                if n == 1 && self.pending_book_rules_sync_on_save {
+                    self.pending_book_rules_sync_on_save = false;
+                    self.auto_refresh_state_after_chapter_saved(1, true);
                 }
             }
             Err(e) => self.status_message = format!("保存章节失败：{e}"),
@@ -727,10 +735,9 @@ impl InkOsApp {
     /// - 若没打开项目 / 写作 LLM 未配置 / 其它 LLM 任务在跑 / 状态档案有未保存改动，
     ///   则**静默跳过**（仅 OpLog 记一条跳过原因），避免打断用户。
     /// - 否则复用 `try_start_state_refresh(REFRESH_ALL_ORDER)` 链路，
-    ///   在后台顺序刷新 novel_brief / current_state / pending_hooks / subplot_board /
-    ///   emotional_arcs / character_matrix / particle_ledger，并本地重建
-    ///   chapter_summaries.md（`book_rules.md` 显式排除）。
-    fn auto_refresh_state_after_chapter_saved(&mut self, n: i32) {
+    ///   在后台顺序刷新 `story_state/` 长期记忆 + `story/author_intent.md` /
+    ///   `story/current_focus.md`，并本地重建 `chapter_summaries.md`。
+    fn auto_refresh_state_after_chapter_saved(&mut self, n: i32, include_book_rules: bool) {
         let novel_root = self.novel_path.clone();
 
         if let Some(reason) = self.state_refresh_prereq_reason() {
@@ -768,10 +775,18 @@ impl InkOsApp {
             "AI 刷新长期记忆 · 自动触发",
             &format!("第 {n} 章保存后"),
         );
-        let queue: Vec<String> = crate::state_refresh::REFRESH_ALL_ORDER
+        let mut queue: Vec<String> = crate::state_refresh::REFRESH_ALL_ORDER
             .iter()
             .map(|s| (*s).to_string())
             .collect();
+        if include_book_rules && n == 1 {
+            queue.push("book_rules.md".to_string());
+            oplog::try_append(
+                novel_root.as_deref(),
+                "AI 刷新长期记忆 · 附加",
+                "第 1 章完成：追加同步 book_rules.md",
+            );
+        }
         self.try_start_state_refresh(queue);
     }
 
@@ -971,8 +986,7 @@ impl InkOsApp {
 
     fn start_state_refresh_current(&mut self) {
         if !crate::state_refresh::is_ai_refreshable(&self.selected_state_file) {
-            self.status_message =
-                "当前文件不支持 AI 刷新（book_rules 与 story/ 下文件请手动维护）".into();
+            self.status_message = "当前文件不支持 AI 刷新（请切换到可刷新档案）".into();
             return;
         }
         self.try_start_state_refresh(vec![self.selected_state_file.clone()]);
@@ -1015,7 +1029,7 @@ impl InkOsApp {
             return;
         };
         let chapter_digest = store.build_chapter_digest(&project_snapshot, 12);
-        let state_documents = match store.load_story_state_documents_map(&project_snapshot) {
+        let state_documents = match self.load_state_refresh_documents_map(&project_snapshot) {
             Ok(m) => m,
             Err(e) => {
                 self.status_message = format!("载入状态档案失败：{e}");
@@ -1154,26 +1168,20 @@ impl InkOsApp {
             return;
         }
         let cleaned = crate::state_refresh::sanitize_model_markdown(raw);
-        let Some(store) = self.store.as_ref() else {
-            self.abort_state_refresh("内部错误：无 ProjectStore");
-            return;
-        };
-        let mut skipped_write = false;
+        let skipped_write = self
+            .state_refresh_batch
+            .as_ref()
+            .and_then(|b| b.state_documents.get(&fname))
+            .map(|old| old.trim() == cleaned.trim())
+            .unwrap_or(false);
+        if !skipped_write {
+            if let Err(e) = self.write_state_refresh_file(&fname, &cleaned) {
+                self.abort_state_refresh(format!("写入 {fname} 失败：{e}"));
+                return;
+            }
+        }
         {
             let b = self.state_refresh_batch.as_mut().unwrap();
-            if b
-                .state_documents
-                .get(&fname)
-                .map(|old| old.trim() == cleaned.trim())
-                .unwrap_or(false)
-            {
-                skipped_write = true;
-            } else {
-                if let Err(e) = store.write_story_state_file(&fname, &cleaned) {
-                    self.abort_state_refresh(format!("写入 {fname} 失败：{e}"));
-                    return;
-                }
-            }
             b.state_documents.insert(fname.clone(), cleaned);
             b.index += 1;
         }
@@ -1548,6 +1556,45 @@ impl InkOsApp {
             out.push_str(&format!("\n### {f}\n{truncated}\n"));
         }
         out
+    }
+
+    fn load_state_refresh_documents_map(
+        &self,
+        project_snapshot: &NovelProject,
+    ) -> anyhow::Result<HashMap<String, String>> {
+        let Some(store) = self.store.as_ref() else {
+            anyhow::bail!("内部错误：无 ProjectStore");
+        };
+        let mut map = store.load_story_state_documents_map(project_snapshot)?;
+        let Some(root) = self.novel_path.as_deref() else {
+            return Ok(map);
+        };
+        for rel in crate::state_refresh::STORY_CONTROL_FILENAMES {
+            let path = root.join(rel);
+            let text = fs::read_to_string(path).unwrap_or_default();
+            map.insert((*rel).to_string(), text);
+        }
+        Ok(map)
+    }
+
+    fn write_state_refresh_file(&self, filename: &str, content: &str) -> anyhow::Result<()> {
+        let Some(store) = self.store.as_ref() else {
+            anyhow::bail!("内部错误：无 ProjectStore");
+        };
+        if filename.starts_with("story/") {
+            let Some(root) = self.novel_path.as_deref() else {
+                anyhow::bail!("未打开项目");
+            };
+            let rel = filename.trim_start_matches("story/");
+            let path = root.join("story").join(rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(path, format!("{}\n", content.trim_end()))?;
+            Ok(())
+        } else {
+            store.write_story_state_file(filename, content)
+        }
     }
 
     fn refresh_pending_hooks(&mut self) {
@@ -4771,6 +4818,7 @@ impl InkOsApp {
         }
         self.chapter_dirty = true;
         self.preview_md = self.chapter_body.clone();
+        self.pending_book_rules_sync_on_save = target_n == 1;
         let words = self.chapter_body.chars().filter(|c| !c.is_whitespace()).count();
         self.status_message = format!(
             "✓ 第 {target_n} 章已生成（{words} 字 · {:.1}s），请核对后保存",
@@ -5053,6 +5101,7 @@ impl InkOsApp {
                             timestamp: crate::project::now_iso(),
                         };
                         let _ = crate::notify::notify_all(&self.settings.notify, &evt);
+                        self.auto_refresh_state_after_chapter_saved(n, n == 1);
                     }
                     Err(e) => {
                         self.auto_gen_log
