@@ -1,0 +1,44 @@
+# 推送形如 v0.2.0 的 tag 时，在 Windows 上构建 release 二进制并上传到 GitHub Release。
+# 需仓库 Settings → Actions → General → Workflow permissions 勾选「Read and write permissions」，
+# 或使用 fine-grained PAT（此处依赖 GITHUB_TOKEN 默认可写 contents）。
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $zip = "inkos_desktop-windows-x64-$tag.zip"
+          Compress-Archive -Path "target/release/inkos_desktop.exe" -DestinationPath $zip -Force
+          echo "ASSET=$zip" >> $env:GITHUB_ENV
+
+      - name: Upload Release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

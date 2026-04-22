@@ -135,6 +135,32 @@
 - `~/.inkos/.env`：全局 LLM 默认配置（与上游 inkos / inkoswin 共享）。
 - `~/.inkoswin/settings.json`：桌面端偏好（最近项目、活跃服务商、流式开关、定时写作钩子）。
 
+## 版本与发行（GitHub Release）
+
+应用内底部状态栏与「帮助 → 关于」页显示：`Cargo.toml` 中的版本号 + 当前构建的 Git 短提交（由 `build.rs` 在编译时写入）。
+
+### 发版前准备
+
+1. 在 [`CHANGELOG.md`](CHANGELOG.md) 顶部增加 `## [x.y.z] - 日期` 小节，用简短条目写清用户可见的变更。
+2. 将 [`Cargo.toml`](Cargo.toml) 里 `[package] version` 改为与发版号一致的 `x.y.z`（与 Git tag 去掉前缀 `v` 后一致）。
+3. 提交上述改动，例如：`git commit -am "chore: release v0.2.0"`。
+
+### 打标签并触发自动构建
+
+本仓库已配置 [`.github/workflows/release.yml`](.github/workflows/release.yml)：向 GitHub **推送** 匹配 `v*` 的 tag 时，会在 `windows-latest` 上执行 `cargo build --release`，并将 `inkos_desktop.exe` 打成 zip 上传到 **同一 tag** 对应的 GitHub Release。
+
+```powershell
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+- tag 名建议与版本一致，例如版本 `0.2.0` 对应 tag `v0.2.0`。
+- 若 Release 未出现附件，请到仓库 **Settings → Actions → General**，将 **Workflow permissions** 设为可写 `contents`（或使用组织策略允许 `GITHUB_TOKEN` 写 Release）。
+
+### 手动发版（不用 Actions 时）
+
+本地 `cargo build --release` 后，在 GitHub 网页 **Releases → Draft a new release** 中选择 tag、上传 zip 即可。
+
 ## 运行
 
 需要本机已安装 [Rust](https://rustup.rs/)（Windows 上通常还需 VS Build Tools 以链接 egui 默认的 `glow` 后端）。

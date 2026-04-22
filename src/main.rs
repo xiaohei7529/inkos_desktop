@@ -31,6 +31,7 @@ mod state_sync;
 mod style;
 mod theme;
 mod vendors;
+mod version_info;
 mod words;
 
 fn main() -> eframe::Result<()> {

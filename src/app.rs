@@ -21,6 +21,7 @@ use crate::project::{self, NovelProject, ProjectStore};
 use crate::state_sync::{self, StateFileChange};
 use crate::theme::{self, color, dim_label, page_header, section_label};
 use crate::vendors::{find as find_vendor, VendorPreset, VENDORS};
+use crate::version_info;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum Section {
@@ -31,6 +32,7 @@ enum Section {
     NovelMeta,
     OpLog,
     Tools,
+    About,
     Settings,
 }
 
@@ -47,6 +49,7 @@ impl Section {
                 "工具箱",
                 "全书搜索、导入、导出 EPUB、改名、写作管线、文风、AIGC、数据分析、同人向导。",
             ),
+            Section::About => ("关于", "版本信息、更新日志与项目链接。"),
             Section::Settings => ("设置", "服务商管理、写作/审计 LLM 配置、字数治理、Agent 路由、通知。"),
         }
     }
@@ -1292,7 +1295,11 @@ impl eframe::App for InkOsApp {
                     ui.add_space(12.0);
                     ui.label(RichText::new(&self.status_message).color(color::TEXT_DIM).size(11.5));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new("InkOS Desktop · v0.1.0").color(color::TEXT_FAINT).size(11.0));
+                        ui.label(
+                            RichText::new(version_info::version_label())
+                                .color(color::TEXT_FAINT)
+                                .size(11.0),
+                        );
                     });
                 });
             });
@@ -1322,6 +1329,7 @@ impl eframe::App for InkOsApp {
                     Section::NovelMeta => self.ui_novel_meta(ui),
                     Section::OpLog => self.ui_oplog(ui),
                     Section::Tools => self.ui_tools(ui),
+                    Section::About => self.ui_about(ui),
                     Section::Settings => self.ui_settings(ui),
                 }
             });
@@ -1636,6 +1644,10 @@ impl InkOsApp {
         Self::nav_item(ui, &mut self.section, Section::NovelMeta, "小说设定");
         Self::nav_item(ui, &mut self.section, Section::OpLog, "操作日志");
         Self::nav_item(ui, &mut self.section, Section::Tools, "工具箱");
+
+        ui.add_space(6.0);
+        section_label(ui, "帮助");
+        Self::nav_item(ui, &mut self.section, Section::About, "关于");
 
         let bottom_h = 60.0;
         let avail = ui.available_height();
@@ -6435,6 +6447,48 @@ impl InkOsApp {
                 }
             }
         });
+    }
+
+    // ---------- 关于 ----------
+    fn ui_about(&mut self, ui: &mut egui::Ui) {
+        const CHANGELOG_MD: &str = include_str!("../CHANGELOG.md");
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                theme::card_frame().show(ui, |ui| {
+                    ui.label(RichText::new("InkOS Desktop").size(18.0).strong());
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(version_info::version_label())
+                            .size(13.0)
+                            .color(color::TEXT),
+                    );
+                    ui.add_space(10.0);
+                    if ui
+                        .link(RichText::new("GitHub 源码与发行版").color(color::ACCENT_HI))
+                        .clicked()
+                    {
+                        ui.ctx()
+                            .open_url(egui::OpenUrl::new_tab(version_info::REPOSITORY_URL));
+                    }
+                });
+
+                ui.add_space(16.0);
+                ui.label(RichText::new("更新日志").size(16.0).strong());
+                ui.add_space(6.0);
+                dim_label(ui, "以下为各版本面向用户的变更摘要；发版前请同步维护 CHANGELOG.md。");
+                ui.add_space(8.0);
+
+                egui::Frame::default()
+                    .fill(color::SURFACE)
+                    .stroke(Stroke::new(1.0, color::BORDER))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(Margin::same(12))
+                    .show(ui, |ui| {
+                        CommonMarkViewer::new().show(ui, &mut self.cm_cache, CHANGELOG_MD);
+                    });
+            });
     }
 
     // ---------- 设置 ----------
