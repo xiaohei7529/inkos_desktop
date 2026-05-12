@@ -10,7 +10,6 @@ use eframe::egui::{self, Color32, ComboBox, CornerRadius, Margin, RichText, Stro
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use crate::audit_log::{self, AuditRecord};
-use crate::chapter_md::parse_chapter_markdown;
 use crate::config::{unique_paths, AppSettings, ConfigPaths, LlmConfig, VendorConfig};
 use crate::fonts::install_cjk_fonts;
 use crate::history::{self, ChapterRevision};
@@ -714,6 +713,8 @@ impl InkOsApp {
                     "保存章节",
                     &format!("第 {n} 章 · {} 字", words),
                 );
+                let body_for_govern = self.chapter_body.clone();
+                self.maybe_queue_word_normalize_prompt(n, &body_for_govern, "保存章节");
 
                 // 保存成功后自动同步「长期记忆档案」（对齐 inkoswin 的连续性前提）。
                 // 否则 [连续性档案] 会滞后于实际章节推进，导致「生成下一章」与前文对不上。
@@ -727,6 +728,58 @@ impl InkOsApp {
             }
             Err(e) => self.status_message = format!("保存章节失败：{e}"),
         }
+    }
+
+    fn maybe_queue_word_normalize_prompt(&mut self, chapter_no: i32, body: &str, scene: &str) {
+        if !self.settings.word_normalize_on_save {
+            return;
+        }
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let goal = project.chapter_word_goal.max(0);
+        if goal <= 0 {
+            return;
+        }
+        let tol = self.settings.effective_word_tolerance();
+        let report = crate::words::evaluate(body, crate::words::WordBudget { goal, tolerance: tol });
+        if matches!(report.status, crate::words::WordStatus::OnTarget) {
+            return;
+        }
+        let prompt = crate::words::normalize_prompt(body, &report);
+        self.assistant_input = prompt;
+        self.status_message = format!(
+            "第 {chapter_no} 章字数{}（当前 {}，目标 {}±{}），已生成归一化 prompt 到写作助手输入框",
+            report.status.label(),
+            report.actual,
+            report.goal,
+            report.tolerance
+        );
+        oplog::try_append(
+            self.novel_path.as_deref(),
+            "字数治理 · 归一化提示",
+            &format!(
+                "第 {chapter_no} 章 · {scene} · 当前 {} / 目标 {}±{}",
+                report.actual, report.goal, report.tolerance
+            ),
+        );
+    }
+
+    fn normalize_generated_summary(&self, summary: &str, body: &str) -> String {
+        let raw = summary.trim();
+        if !self.settings.summary_standardize {
+            return raw.to_string();
+        }
+        // 统一到近似 60-80 字风格；过短时回退正文自动摘要，过长时截断。
+        let mut normalized = if raw.chars().count() < 40 {
+            crate::chapter_md::make_summary(body, 80)
+        } else {
+            raw.to_string()
+        };
+        if normalized.chars().count() > 80 {
+            normalized = normalized.chars().take(80).collect::<String>().trim_end().to_string();
+        }
+        normalized
     }
 
     /// 保存章节后尝试自动触发「AI 刷新全部长期记忆档案」。
@@ -4492,15 +4545,17 @@ impl InkOsApp {
             return;
         }
         let state_docs = self.collect_state_docs_for_prompt(3000);
-        let (summaries, novel_brief) = {
+        let (summaries, novel_brief, goal, tol) = {
             let Some(project) = self.project.as_ref() else { return };
             let Some(store) = self.store.as_ref() else { return };
             let summaries = store.build_chapter_summaries_document(project);
+            let goal = project.chapter_word_goal.max(0);
+            let tol = self.settings.effective_word_tolerance();
             let novel_brief = format!(
                 "书名：{}\n题材：{}\n字数目标：约 {} 字/章\n核心：{}\n主角：{}\n世界：{}\n文风：{}\n大纲：{}\n额外提示：{}",
                 project.title.trim(),
                 project.genre.trim(),
-                project.chapter_word_goal,
+                goal,
                 project.premise.trim(),
                 project.protagonists.trim(),
                 project.world_setting.trim(),
@@ -4508,7 +4563,7 @@ impl InkOsApp {
                 project.outline.trim(),
                 project.extra_guidance.trim(),
             );
-            (summaries, novel_brief)
+            (summaries, novel_brief, goal, tol)
         };
         let audit_block = if self.auto_gen_audit_text.trim().is_empty() {
             "（无）".to_string()
@@ -4526,8 +4581,10 @@ impl InkOsApp {
                  - 与状态档案、已埋伏笔严格保持一致。",
             ),
             ChatMessage::user(format!(
-                "## 小说设定\n{novel_brief}\n\n## 状态档案\n{}\n\n## 历史章节摘要\n{summaries}\n\n## 上一章审计要点\n{audit_block}\n\n请创作【第 {next_n} 章】。",
-                if state_docs.is_empty() { "（无）".to_string() } else { state_docs }
+                "## 小说设定\n{novel_brief}\n\n## 状态档案\n{state_docs_block}\n\n## 历史章节摘要\n{summaries}\n\n## 上一章审计要点\n{audit_block}\n\n## 字数硬约束\n本章正文必须落在 [{min_words}, {max_words}] 字区间，偏差不得超过容差，禁止用无意义段落凑字数。\n\n请创作【第 {next_n} 章】。",
+                state_docs_block = if state_docs.is_empty() { "（无）".to_string() } else { state_docs },
+                min_words = (goal - tol).max(0),
+                max_words = goal + tol,
             )),
         ];
 
@@ -4661,8 +4718,10 @@ impl InkOsApp {
         let tol = self.settings.effective_word_tolerance();
         if project_snapshot.chapter_word_goal > 0 {
             user_prompt.push_str(&format!(
-                "\n\n[字数治理]\n目标约 {} 字（容差 ±{tol}），不得硬截断。",
-                project_snapshot.chapter_word_goal
+                "\n\n[字数治理]\n正文必须落在 [{} , {}] 字区间（目标 {}，容差 ±{tol}），不得硬截断，不得用空洞重复凑字数。",
+                (project_snapshot.chapter_word_goal - tol).max(0),
+                project_snapshot.chapter_word_goal + tol,
+                project_snapshot.chapter_word_goal,
             ));
         }
 
@@ -4809,7 +4868,8 @@ impl InkOsApp {
         self.chapter_body = result.content;
         // 摘要：若 LLM 给出，则写入摘要编辑框并标记为 dirty 供用户一并保存；
         // 否则保留原摘要（parse_generation_output 已在 fallback 场景自动生成 make_summary）。
-        let summary_trim = result.summary.trim();
+        let normalized_summary = self.normalize_generated_summary(&result.summary, &self.chapter_body);
+        let summary_trim = normalized_summary.trim();
         if !summary_trim.is_empty()
             && summary_trim != self.chapter_summary.trim()
         {
@@ -4824,6 +4884,8 @@ impl InkOsApp {
             "✓ 第 {target_n} 章已生成（{words} 字 · {:.1}s），请核对后保存",
             task.elapsed_secs()
         );
+        let body_for_govern = self.chapter_body.clone();
+        self.maybe_queue_word_normalize_prompt(target_n, &body_for_govern, "生成本章");
         oplog::try_append(
             self.novel_path.as_deref(),
             "AI 生成本章 · 完成",
@@ -5067,11 +5129,20 @@ impl InkOsApp {
                         .push(format!("{}  第 {n} 章空响应", short_time()));
                     return;
                 }
-                let (title, body) = parse_chapter_markdown(&raw);
-                let title = if title.is_empty() { format!("第{n}章") } else { title };
+                // 与「生成本章」对齐：优先解析 标题/摘要/正文 三段；
+                // 若模型未给摘要，则 parse_generation_output 会回退生成摘要。
+                let fallback_title = format!("第{n}章");
+                let result = inkoswin_prompt::parse_generation_output(&raw, &fallback_title);
+                let title = if result.title.trim().is_empty() {
+                    fallback_title
+                } else {
+                    result.title.trim().to_string()
+                };
+                let body = result.content;
+                let summary = self.normalize_generated_summary(&result.summary, &body);
                 let novel_root = self.novel_path.clone();
                 let (Some(store), Some(project)) = (&self.store, &mut self.project) else { return };
-                match store.save_chapter(project, n, &title, &body, "generated", "") {
+                match store.save_chapter(project, n, &title, &body, "generated", &summary) {
                     Ok(()) => {
                         project.auto_generate.last_run_at = crate::project::now_iso();
                         let _ = store.save_project(project);
@@ -6744,6 +6815,15 @@ impl InkOsApp {
                     .checkbox(
                         &mut self.settings.word_normalize_on_save,
                         "保存章节时弹出「归一化 prompt」",
+                    )
+                    .changed()
+                {
+                    save_settings = true;
+                }
+                if ui
+                    .checkbox(
+                        &mut self.settings.summary_standardize,
+                        "统一章节摘要（60-80 字）",
                     )
                     .changed()
                 {

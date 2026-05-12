@@ -359,6 +359,9 @@ pub struct AppSettings {
     /// 字数归一化是否在保存前自动执行（true 仅追加 prompt，不会自动调用 LLM）。
     #[serde(default)]
     pub word_normalize_on_save: bool,
+    /// 是否对模型产出的章节摘要做统一标准化（建议 60-80 字，避免不同链路风格漂移）。
+    #[serde(default = "default_summary_standardize")]
+    pub summary_standardize: bool,
     /// 章节手动保存成功后，自动串联一次「AI 刷新全部长期记忆档案」。
     ///
     /// 桌面端保留章节手动保存的语义，不自动落盘章节正文；但长期记忆档案
@@ -388,6 +391,10 @@ fn default_word_tolerance() -> i32 {
 }
 
 fn default_auto_refresh_state() -> bool {
+    true
+}
+
+fn default_summary_standardize() -> bool {
     true
 }
 

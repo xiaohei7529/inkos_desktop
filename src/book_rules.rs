@@ -568,7 +568,7 @@ pub fn build_generation_prompts(
     let chapter_word_goal = if project.chapter_word_goal > 0 {
         project.chapter_word_goal
     } else {
-        2500
+        3000
     };
 
     // 是否输出 numericalSystemOverrides：依据 premise/world_setting/outline 中

@@ -13,7 +13,7 @@ pub struct WordBudget {
 impl Default for WordBudget {
     fn default() -> Self {
         Self {
-            goal: 2500,
+            goal: 3000,
             tolerance: 350,
         }
     }

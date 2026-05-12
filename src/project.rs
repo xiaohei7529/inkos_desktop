@@ -85,7 +85,7 @@ impl Default for NovelProject {
             outline: String::new(),
             extra_guidance: String::new(),
             target_chapters: 500,
-            chapter_word_goal: 2500,
+            chapter_word_goal: 3000,
             auto_generate: AutoGeneratePlan::default(),
             chapters: Vec::new(),
             updated_at: now_iso(),
@@ -152,7 +152,7 @@ impl ProjectStore {
             project.target_chapters = 500;
         }
         if project.chapter_word_goal <= 0 {
-            project.chapter_word_goal = 2500;
+            project.chapter_word_goal = 3000;
         }
         if project.auto_generate.interval_minutes <= 0 {
             project.auto_generate.interval_minutes = 30;
