@@ -351,6 +351,9 @@ impl ProjectStore {
     }
 
     pub fn build_chapter_summaries_document(&self, project: &NovelProject) -> String {
+        /// 最近 N 章保留完整摘要，更早的章节归档到底部精简区段。
+        const RECENT_CHAPTER_LIMIT: usize = 100;
+
         let mut lines: Vec<String> = vec![
             "# 各章摘要".to_string(),
             String::new(),
@@ -380,7 +383,50 @@ impl ProjectStore {
             return lines.join("\n").trim_end().to_string() + "\n";
         }
 
-        for chapter in chs {
+        let total = chs.len();
+        let (archived_chs, recent_chs) = if total > RECENT_CHAPTER_LIMIT {
+            chs.split_at(total - RECENT_CHAPTER_LIMIT)
+        } else {
+            (&[][..], &chs[..])
+        };
+
+        // 归档区段（超出阈值的早期章节，只保留一行简要）
+        if !archived_chs.is_empty() {
+            lines.push(format!(
+                "## 早期章节归档（第 1 章 ～ 第 {} 章，共 {} 章）",
+                archived_chs.last().map(|c| c.number).unwrap_or(0),
+                archived_chs.len()
+            ));
+            lines.push(String::new());
+            for chapter in archived_chs {
+                let sum = chapter.summary.trim();
+                let title_part = if chapter.title.trim().is_empty() {
+                    format!("第{}章", chapter.number)
+                } else {
+                    chapter.title.trim().to_string()
+                };
+                if sum.is_empty() {
+                    lines.push(format!("- 第{}章《{}》", chapter.number, title_part));
+                } else {
+                    let short: String = sum.chars().take(60).collect();
+                    let short = if sum.chars().count() > 60 {
+                        format!("{short}…")
+                    } else {
+                        short
+                    };
+                    lines.push(format!("- 第{}章《{}》：{short}", chapter.number, title_part));
+                }
+            }
+            lines.push(String::new());
+            lines.push(format!(
+                "## 最近 {} 章详细摘要",
+                recent_chs.len()
+            ));
+            lines.push(String::new());
+        }
+
+        // 最近章节（含完整摘要）
+        for chapter in recent_chs {
             let (t, c) = self
                 .load_chapter_content(chapter.number)
                 .unwrap_or_default();
@@ -539,6 +585,10 @@ const STATE_SPECS: &[StateSpec] = &[
     StateSpec {
         filename: "novel_brief.md",
         template: include_str!("../assets/state/novel_brief.md"),
+    },
+    StateSpec {
+        filename: "outline.md",
+        template: include_str!("../assets/state/outline.md"),
     },
     StateSpec {
         filename: "subplot_board.md",

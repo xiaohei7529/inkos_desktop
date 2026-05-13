@@ -23,7 +23,9 @@ pub struct ChapterGenerationResult {
 }
 
 /// 连续性档案有序 + 限长策略（对齐 `_build_state_context_text`）。
+/// outline.md 优先注入，防止续写跑偏；book_rules.md 作为硬约束兜底。
 const ORDERED_STATE_FILES: &[&str] = &[
+    "outline.md",
     "novel_brief.md",
     "current_state.md",
     "pending_hooks.md",
@@ -32,10 +34,12 @@ const ORDERED_STATE_FILES: &[&str] = &[
     "character_matrix.md",
     "particle_ledger.md",
     "chapter_summaries.md",
+    "book_rules.md",
 ];
 
 fn state_title(filename: &str) -> &'static str {
     match filename {
+        "outline.md" => "书籍大纲与细纲",
         "novel_brief.md" => "小说简报",
         "current_state.md" => "当前状态",
         "pending_hooks.md" => "待回收伏笔",
@@ -51,6 +55,7 @@ fn state_title(filename: &str) -> &'static str {
 
 fn limit_for_state(filename: &str) -> usize {
     match filename {
+        "outline.md" => 3000,
         "chapter_summaries.md" => 1200,
         "novel_brief.md" => 2200,
         _ => 800,

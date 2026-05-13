@@ -6,6 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::config::VendorConfig;
 
@@ -215,6 +216,133 @@ pub fn spawn_chat(
 pub fn spawn_ping(cfg: VendorConfig, model: String) -> LlmTask {
     let messages = vec![ChatMessage::user("请回复一个字 ok。")];
     spawn_chat(cfg, "test".into(), model, messages, false)
+}
+
+/// 后台拉取 OpenAI 兼容 `GET /v1/models` 列表（在 UI 线程外阻塞网络）。
+pub struct ModelsFetchTask {
+    rx: Receiver<Result<Vec<String>, String>>,
+    pub done: bool,
+    pub models: Vec<String>,
+    pub error: Option<String>,
+}
+
+impl ModelsFetchTask {
+    pub fn drain(&mut self) -> bool {
+        if self.done {
+            return false;
+        }
+        match self.rx.try_recv() {
+            Ok(Ok(list)) => {
+                self.models = list;
+                self.done = true;
+                true
+            }
+            Ok(Err(e)) => {
+                self.error = Some(e);
+                self.done = true;
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.error = Some("请求中断".into());
+                self.done = true;
+                true
+            }
+        }
+    }
+}
+
+pub fn spawn_fetch_models(cfg: VendorConfig) -> ModelsFetchTask {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let r = fetch_models_list(&cfg);
+        let _ = tx.send(r);
+    });
+    ModelsFetchTask {
+        rx,
+        done: false,
+        models: Vec::new(),
+        error: None,
+    }
+}
+
+/// `GET {base_url}/models`，`Authorization: Bearer {api_key}`（与 chat 一致：Key 为空则不带头）。
+fn fetch_models_list(cfg: &VendorConfig) -> Result<Vec<String>, String> {
+    let base = cfg.base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("Base URL 未设置".into());
+    }
+    let url = format!("{base}/models");
+    let mut last_err = String::new();
+    let mut resp = None;
+    for attempt in 0..=2 {
+        let agent = build_agent();
+        let mut req = agent.get(&url);
+        let key = cfg.api_key.trim();
+        if !key.is_empty() {
+            req = req.set("Authorization", &format!("Bearer {key}"));
+        }
+        match req.call() {
+            Ok(r) => {
+                resp = Some(r);
+                break;
+            }
+            Err(ureq::Error::Status(code, body)) => {
+                let txt = body.into_string().unwrap_or_default();
+                return Err(format!("HTTP {code}: {}", truncate(&txt, 600)));
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if attempt < 2 && retryable_error(&msg) {
+                    thread::sleep(Duration::from_millis(700 * (attempt + 1) as u64));
+                    continue;
+                }
+                last_err = classify_error(&msg);
+                break;
+            }
+        }
+    }
+    let Some(resp) = resp else {
+        return Err(last_err);
+    };
+    let txt = resp
+        .into_string()
+        .map_err(|e| format!("读取响应失败：{e}"))?;
+    parse_models_json(&txt)
+}
+
+fn parse_models_json(txt: &str) -> Result<Vec<String>, String> {
+    let v: Value = serde_json::from_str(txt).map_err(|e| format!("JSON 解析失败：{e}"))?;
+
+    if let Some(data) = v.get("data").and_then(|d| d.as_array()) {
+        let mut ids: Vec<String> = data
+            .iter()
+            .filter_map(|item| item.get("id").and_then(|x| x.as_str()).map(str::to_string))
+            .collect();
+        if !ids.is_empty() {
+            ids.sort();
+            ids.dedup();
+            return Ok(ids);
+        }
+    }
+
+    if let Some(data) = v.get("models").and_then(|d| d.as_array()) {
+        let mut ids: Vec<String> = Vec::new();
+        for item in data {
+            if let Some(id) = item.get("id").and_then(|x| x.as_str()) {
+                ids.push(id.to_string());
+            } else if let Some(name) = item.get("name").and_then(|x| x.as_str()) {
+                ids.push(name.to_string());
+            }
+        }
+        if !ids.is_empty() {
+            ids.sort();
+            ids.dedup();
+            return Ok(ids);
+        }
+    }
+
+    Err("响应中未找到模型列表（期望 `data[].id` 或 `models[]` 含 id/name）".into())
 }
 
 fn build_agent() -> ureq::Agent {

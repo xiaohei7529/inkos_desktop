@@ -14,12 +14,12 @@ use crate::config::{unique_paths, AppSettings, ConfigPaths, LlmConfig, VendorCon
 use crate::fonts::install_cjk_fonts;
 use crate::history::{self, ChapterRevision};
 use crate::inkoswin_prompt;
-use crate::llm::{spawn_chat, spawn_ping, ChatMessage, LlmTask};
+use crate::llm::{spawn_chat, spawn_fetch_models, spawn_ping, ChatMessage, LlmTask, ModelsFetchTask};
 use crate::oplog::{self, OpLogEntry};
 use crate::project::{self, NovelProject, ProjectStore};
 use crate::state_sync::{self, StateFileChange};
 use crate::theme::{self, color, dim_label, page_header, section_label};
-use crate::vendors::{find as find_vendor, VendorPreset, VENDORS};
+use crate::vendors::{find as find_vendor, VENDORS};
 use crate::version_info;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -130,6 +130,7 @@ const STATE_FILES: &[&str] = &[
     "pending_hooks.md",
     "chapter_summaries.md",
     "novel_brief.md",
+    "outline.md",
     "subplot_board.md",
     "emotional_arcs.md",
     "character_matrix.md",
@@ -281,6 +282,12 @@ pub struct InkOsApp {
     edit_vendor_buf: VendorConfig,
     vendor_test_task: Option<LlmTask>,
     vendor_test_msg: String,
+    vendor_models_task: Option<ModelsFetchTask>,
+    vendor_models_msg: String,
+    vendor_models_list: Vec<String>,
+    vendor_models_filter: String,
+    /// 设置页服务商列表当前选中项（左右分栏内嵌编辑）
+    selected_vendor_id: Option<String>,
 
     // ---- 工具箱（Tools）----
     tools_tab: ToolsTab,
@@ -333,6 +340,13 @@ pub struct InkOsApp {
     fanfic_msg: String,
 
     status_message: String,
+
+    // ---- 新建小说向导 ----
+    novel_wizard_open: bool,
+    /// 向导中选定的新建目录路径
+    wizard_dir: String,
+    /// 向导临时编辑的小说设定
+    wizard_project: NovelProject,
 }
 
 impl InkOsApp {
@@ -431,6 +445,11 @@ impl InkOsApp {
             edit_vendor_buf: VendorConfig::default(),
             vendor_test_task: None,
             vendor_test_msg: String::new(),
+            vendor_models_task: None,
+            vendor_models_msg: String::new(),
+            vendor_models_list: Vec::new(),
+            vendor_models_filter: String::new(),
+            selected_vendor_id: None,
 
             tools_tab: ToolsTab::Search,
             search_query: String::new(),
@@ -473,6 +492,10 @@ impl InkOsApp {
             fanfic_msg: String::new(),
 
             status_message: "就绪".into(),
+
+            novel_wizard_open: false,
+            wizard_dir: String::new(),
+            wizard_project: NovelProject::default(),
         };
 
         if !app.settings.default_novel_path.is_empty() {
@@ -1395,10 +1418,10 @@ impl eframe::App for InkOsApp {
                 }
             });
 
-        self.show_vendor_editor(ctx);
         self.show_chapter_history_modal(ctx);
         self.show_gen_confirm_modal(ctx);
         self.show_book_rules_confirm_modal(ctx);
+        self.show_novel_wizard(ctx);
     }
 }
 
@@ -1572,6 +1595,22 @@ impl InkOsApp {
                     format!("✓  成功：{}", first_line(&task.accumulated))
                 };
                 self.vendor_test_task = None;
+            } else {
+                any_running = true;
+            }
+        }
+        if let Some(task) = &mut self.vendor_models_task {
+            task.drain();
+            if task.done {
+                if let Some(e) = task.error.clone() {
+                    self.vendor_models_msg = format!("✗  {e}");
+                    self.vendor_models_list.clear();
+                } else {
+                    self.vendor_models_list = std::mem::take(&mut task.models);
+                    self.vendor_models_msg =
+                        format!("✓  已获取 {} 个模型（点击列表项填入「默认模型」）", self.vendor_models_list.len());
+                }
+                self.vendor_models_task = None;
             } else {
                 any_running = true;
             }
@@ -1860,12 +1899,21 @@ impl InkOsApp {
                     }
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("📁  选择目录…").clicked() {
+                    if ui.button("📁  打开目录…").clicked() {
                         if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                             if let Err(e) = self.load_novel_dir(dir) {
                                 self.status_message = format!("加载失败：{e}");
                             }
                         }
+                    }
+                    if ui
+                        .button("✨  新建小说…")
+                        .on_hover_text("创建小说档案并初始化状态档案，完成后才能开始写作。")
+                        .clicked()
+                    {
+                        self.wizard_project = NovelProject::default();
+                        self.wizard_dir.clear();
+                        self.novel_wizard_open = true;
                     }
                 });
             });
@@ -2662,6 +2710,191 @@ impl InkOsApp {
         }
     }
 
+    fn show_novel_wizard(&mut self, ctx: &egui::Context) {
+        if !self.novel_wizard_open {
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.novel_wizard_open = false;
+            return;
+        }
+
+        let mut open = true;
+        let mut want_create = false;
+        let mut want_pick_dir = false;
+
+        egui::Window::new("✨  新建小说")
+            .id(egui::Id::new("novel_wizard_window"))
+            .open(&mut open)
+            .resizable(true)
+            .collapsible(false)
+            .default_width(540.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(400.0);
+
+                // 步骤 1：选择目录
+                egui::Frame::default()
+                    .fill(color::SURFACE_HI)
+                    .stroke(Stroke::new(1.0, color::BORDER))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(Margin::symmetric(12, 10))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("小说目录").size(11.5).color(color::TEXT_DIM));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("📁  选择目录").clicked() {
+                                    want_pick_dir = true;
+                                }
+                            });
+                        });
+                        if self.wizard_dir.is_empty() {
+                            dim_label(ui, "请选择一个空目录（或新建文件夹）作为小说根目录");
+                        } else {
+                            ui.label(RichText::new(&self.wizard_dir).color(color::ACCENT).size(12.0));
+                        }
+                    });
+
+                ui.add_space(10.0);
+
+                // 步骤 2：填写小说基本信息
+                ui.label(RichText::new("小说档案").size(13.5).strong());
+                ui.add_space(6.0);
+
+                let field = |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, salt: &str| {
+                    ui.label(RichText::new(label).size(11.5).color(color::TEXT_DIM));
+                    ui.add(
+                        TextEdit::singleline(value)
+                            .hint_text(hint)
+                            .desired_width(f32::INFINITY)
+                            .id_salt(salt),
+                    );
+                    ui.add_space(6.0);
+                };
+
+                let multiline_field = |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, salt: &str| {
+                    ui.label(RichText::new(label).size(11.5).color(color::TEXT_DIM));
+                    ui.add(
+                        TextEdit::multiline(value)
+                            .hint_text(hint)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(3)
+                            .id_salt(salt),
+                    );
+                    ui.add_space(6.0);
+                };
+
+                egui::ScrollArea::vertical()
+                    .id_salt("wizard_scroll")
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        field(ui, "标题 *", &mut self.wizard_project.title, "小说名称", "wz_title");
+
+                        // 题材下拉
+                        ui.label(RichText::new("题材 *").size(11.5).color(color::TEXT_DIM));
+                        ComboBox::from_id_salt("wz_genre")
+                            .width(200.0)
+                            .selected_text(if self.wizard_project.genre.is_empty() {
+                                "请选择题材"
+                            } else {
+                                &self.wizard_project.genre
+                            })
+                            .show_ui(ui, |ui| {
+                                for g in GENRES {
+                                    if ui.selectable_label(self.wizard_project.genre == *g, *g).clicked() {
+                                        self.wizard_project.genre = (*g).to_string();
+                                    }
+                                }
+                            });
+                        ui.add_space(6.0);
+
+                        multiline_field(ui, "故事核心 / 前提 *", &mut self.wizard_project.premise,
+                            "核心冲突、主角目标、故事背景…", "wz_premise");
+                        multiline_field(ui, "主角与关键角色", &mut self.wizard_project.protagonists,
+                            "主角姓名、性格、能力；重要配角…", "wz_protagonists");
+                        multiline_field(ui, "世界观与背景", &mut self.wizard_project.world_setting,
+                            "时代、地域、魔法/科技体系…", "wz_world");
+                        multiline_field(ui, "文风与节奏要求", &mut self.wizard_project.writing_style,
+                            "叙事视角、文笔风格、情节节奏…", "wz_style");
+
+                        ui.label(RichText::new("目标章节数").size(11.5).color(color::TEXT_DIM));
+                        ui.add(
+                            egui::DragValue::new(&mut self.wizard_project.target_chapters)
+                                .range(1..=10000)
+                                .speed(1.0),
+                        );
+                        ui.add_space(6.0);
+
+                        ui.label(RichText::new("目标字/章").size(11.5).color(color::TEXT_DIM));
+                        ui.add(
+                            egui::DragValue::new(&mut self.wizard_project.chapter_word_goal)
+                                .range(500..=20000)
+                                .speed(100.0),
+                        );
+                        ui.add_space(6.0);
+                    });
+
+                ui.add_space(8.0);
+                dim_label(ui, "* 标题、题材、故事核心为必填项，缺失将无法触发 AI 生成。");
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    let can_create = !self.wizard_dir.is_empty()
+                        && !self.wizard_project.title.trim().is_empty()
+                        && !self.wizard_project.premise.trim().is_empty();
+                    ui.add_enabled_ui(can_create, |ui| {
+                        if ui.button(RichText::new("🚀  创建小说档案").strong()).clicked() {
+                            want_create = true;
+                        }
+                    });
+                    if ui.button("取消").clicked() {
+                        self.novel_wizard_open = false;
+                    }
+                });
+            });
+
+        if want_pick_dir {
+            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                self.wizard_dir = dir.display().to_string();
+                // 若标题为空，用目录名作为默认标题
+                if self.wizard_project.title.trim().is_empty() {
+                    if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+                        self.wizard_project.title = name.to_string();
+                    }
+                }
+            }
+        }
+
+        if want_create {
+            let dir = std::path::PathBuf::from(&self.wizard_dir);
+            let store = crate::project::ProjectStore::new(dir.clone());
+            let mut project = self.wizard_project.clone();
+            match store.save_project(&mut project) {
+                Ok(()) => {
+                    self.novel_wizard_open = false;
+                    if let Err(e) = self.load_novel_dir(dir) {
+                        self.status_message = format!("创建成功但加载失败：{e}");
+                    } else {
+                        self.section = Section::NovelMeta;
+                        self.status_message = format!(
+                            "已创建小说《{}》，状态档案已初始化。",
+                            self.wizard_project.title.trim()
+                        );
+                    }
+                }
+                Err(e) => {
+                    self.status_message = format!("创建失败：{e}");
+                }
+            }
+        }
+
+        if !open {
+            self.novel_wizard_open = false;
+        }
+    }
+
     fn show_chapter_history_modal(&mut self, ctx: &egui::Context) {
         let Some(n) = self.history_open_for else { return };
         // ESC 一键关闭
@@ -3148,6 +3381,7 @@ impl InkOsApp {
         let mut start = false;
         let mut clear_result = false;
         let mut replace_now = false;
+        let mut resync_review = false;
 
         theme::card_frame().show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -3253,6 +3487,29 @@ impl InkOsApp {
                     } else if ui.button(action_label).on_hover_text(tooltip).clicked() {
                         start = true;
                     }
+                    let review_retryable = self.review_task.is_none()
+                        && self.review_target.is_some()
+                        && self.review_for_chapter == self.review_target
+                        && Self::review_llm_failure_retryable(&self.review_result);
+                    if review_retryable {
+                        let (hover_audit, hover_rewrite) = (
+                            "上次审计因接口超时、连接中断或其它请求失败未完成时，\
+                             使用当前章节与状态档案再次发起审计（会清空下方结果区后重新请求）。",
+                            "上次改写因接口超时、连接中断或其它请求失败未完成时，\
+                             使用当前章节与审计上下文再次发起改写（会清空下方结果区后重新请求）。",
+                        );
+                        let hover = match self.review_mode {
+                            ReviewMode::Audit => hover_audit,
+                            ReviewMode::Rewrite => hover_rewrite,
+                        };
+                        if ui
+                            .button(RichText::new("🔄  重新同步").color(color::ACCENT_HI))
+                            .on_hover_text(hover)
+                            .clicked()
+                        {
+                            resync_review = true;
+                        }
+                    }
                     if self.review_mode == ReviewMode::Rewrite
                         && self.review_task.is_none()
                         && !self.review_result.trim().is_empty()
@@ -3286,6 +3543,25 @@ impl InkOsApp {
             self.selected_audit_ts = None;
         }
         if start {
+            match self.review_mode {
+                ReviewMode::Audit => self.start_review_audit(),
+                ReviewMode::Rewrite => self.start_review_rewrite(),
+            }
+        }
+        if resync_review {
+            if let Some(n) = self.review_target {
+                let (tag, detail) = match self.review_mode {
+                    ReviewMode::Audit => (
+                        "AI 审计 · 重新同步",
+                        format!("第 {n} 章（上次请求失败后重试）"),
+                    ),
+                    ReviewMode::Rewrite => (
+                        "AI 改写 · 重新同步",
+                        format!("第 {n} 章（上次请求失败后重试）"),
+                    ),
+                };
+                oplog::try_append(self.novel_path.as_deref(), tag, &detail);
+            }
             match self.review_mode {
                 ReviewMode::Audit => self.start_review_audit(),
                 ReviewMode::Rewrite => self.start_review_rewrite(),
@@ -3707,6 +3983,15 @@ impl InkOsApp {
             rec.time,
             rec.chars
         );
+    }
+
+    /// 审核 / 改写：上次 LLM 请求是否以失败结束（与 `poll_llm_tasks` 写入的文案对齐）。
+    fn review_llm_failure_retryable(review_result: &str) -> bool {
+        let t = review_result.trim();
+        if t.is_empty() {
+            return false;
+        }
+        t.contains("（请求失败）") || t.contains("（请求中断）")
     }
 
     fn start_review_audit(&mut self) {
@@ -4612,6 +4897,14 @@ impl InkOsApp {
         if self.manual_gen_task.is_some() {
             self.status_message = "已有生成任务在进行中".into();
             return;
+        }
+        // 检查小说档案是否已完善（标题和故事核心是必填项）
+        if let Some(ref p) = self.project {
+            if p.title.trim().is_empty() || p.premise.trim().is_empty() {
+                self.status_message = "请先前往「小说设定」完善小说档案（标题和故事核心为必填项）再生成。".into();
+                self.section = Section::NovelMeta;
+                return;
+            }
         }
         let vendor_id = self.settings.writing_vendor.clone();
         if vendor_id.is_empty() {
@@ -6614,6 +6907,7 @@ impl InkOsApp {
     // ---------- 设置 ----------
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+            // ── 服务商管理标题 ──
             ui.label(RichText::new("服务商管理").size(20.0).strong());
             ui.add_space(4.0);
             dim_label(
@@ -6623,9 +6917,42 @@ impl InkOsApp {
             ui.add_space(8.0);
 
             self.ui_detected_card(ui);
+            ui.add_space(12.0);
 
-            ui.add_space(16.0);
-            self.ui_vendor_grid(ui);
+            // ── 左右分栏：服务商列表 + 配置面板 ──
+            egui::Frame::default()
+                .fill(color::SURFACE)
+                .stroke(Stroke::new(1.0, color::BORDER))
+                .corner_radius(CornerRadius::same(12))
+                .show(ui, |ui| {
+                    ui.set_min_height(340.0);
+                    ui.columns(2, |cols| {
+                        // 左栏：服务商列表
+                        let left = &mut cols[0];
+                        left.set_width(left.available_width().min(220.0));
+                        egui::Frame::default()
+                            .fill(color::SURFACE_HI)
+                            .stroke(Stroke::new(0.0, color::BORDER))
+                            .corner_radius(CornerRadius {
+                                nw: 12,
+                                sw: 12,
+                                ne: 0,
+                                se: 0,
+                            })
+                            .inner_margin(Margin::symmetric(0, 0))
+                            .show(left, |ui| {
+                                self.ui_vendor_list(ui);
+                            });
+
+                        // 右栏：配置面板
+                        let right = &mut cols[1];
+                        egui::Frame::default()
+                            .inner_margin(Margin::symmetric(16, 14))
+                            .show(right, |ui| {
+                                self.ui_vendor_config_panel(ui);
+                            });
+                    });
+                });
 
             ui.add_space(16.0);
             self.ui_writing_llm_card(ui);
@@ -6676,6 +7003,410 @@ impl InkOsApp {
                 );
             }
         });
+    }
+
+    /// 左侧服务商列表（替代旧 `ui_vendor_grid`）
+    fn ui_vendor_list(&mut self, ui: &mut egui::Ui) {
+        let mut to_select: Option<String> = None;
+
+        egui::ScrollArea::vertical()
+            .id_salt("vendor_list_scroll")
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("服务商").size(11.0).color(color::TEXT_FAINT));
+                });
+                ui.add_space(4.0);
+
+                for v in VENDORS {
+                    let configured = self
+                        .settings
+                        .vendors
+                        .get(v.id)
+                        .map(|c| c.is_configured())
+                        .unwrap_or(false);
+                    let selected = self.selected_vendor_id.as_deref() == Some(v.id);
+
+                    let resp = egui::Frame::default()
+                        .fill(if selected {
+                            color::ACCENT.linear_multiply(0.18)
+                        } else {
+                            Color32::TRANSPARENT
+                        })
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(Margin::symmetric(12, 7))
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                // 配置状态指示点
+                                let dot_color = if configured {
+                                    color::SUCCESS
+                                } else {
+                                    color::TEXT_FAINT
+                                };
+                                let (dot_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(8.0, 8.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().circle_filled(dot_rect.center(), 3.5, dot_color);
+
+                                ui.add_space(4.0);
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        RichText::new(v.name)
+                                            .size(13.0)
+                                            .color(if selected {
+                                                color::ACCENT_HI
+                                            } else {
+                                                color::TEXT
+                                            })
+                                            .strong(),
+                                    );
+                                    if !v.note.is_empty() {
+                                        ui.label(
+                                            RichText::new(v.note)
+                                                .size(10.5)
+                                                .color(color::TEXT_FAINT),
+                                        );
+                                    }
+                                });
+                            });
+                        })
+                        .response
+                        .interact(egui::Sense::click());
+
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if resp.clicked() {
+                        to_select = Some(v.id.to_string());
+                    }
+                }
+                ui.add_space(8.0);
+            });
+
+        if let Some(id) = to_select {
+            if self.selected_vendor_id.as_deref() != Some(&id) {
+                self.open_vendor_editor(&id.clone());
+                self.selected_vendor_id = Some(id);
+                self.vendor_test_msg.clear();
+                self.vendor_test_task = None;
+                self.vendor_models_task = None;
+                self.vendor_models_msg.clear();
+                self.vendor_models_list.clear();
+                self.vendor_models_filter.clear();
+            }
+        }
+    }
+
+    /// 右侧内嵌配置面板（替代旧浮窗 `show_vendor_editor`）
+    fn ui_vendor_config_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(id) = self.selected_vendor_id.clone() else {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    RichText::new("← 从左侧选择服务商进行配置")
+                        .color(color::TEXT_FAINT)
+                        .size(13.0),
+                );
+            });
+            return;
+        };
+
+        let preset = find_vendor(&id);
+        let title = preset
+            .map(|p| p.name.to_string())
+            .unwrap_or_else(|| id.clone());
+
+        let mut want_save = false;
+        let mut want_delete = false;
+        let mut want_test = false;
+        let mut want_fetch_models = false;
+
+        // 标题行
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&title).size(16.0).strong());
+            if self
+                .settings
+                .vendors
+                .get(&id)
+                .map(|c| c.is_configured())
+                .unwrap_or(false)
+            {
+                ui.add_space(6.0);
+                theme::pill(ui, "已配置", color::SUCCESS, color::SUCCESS.linear_multiply(0.15));
+            }
+        });
+        if let Some(p) = preset {
+            if !p.note.is_empty() {
+                dim_label(ui, p.note);
+            }
+        }
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(10.0);
+
+        // 基础配置区
+        ui.label(RichText::new("基础配置").size(11.5).color(color::TEXT_FAINT));
+        ui.add_space(6.0);
+
+        ui.label(RichText::new("Base URL").size(11.5).color(color::TEXT_DIM));
+        ui.add(
+            TextEdit::singleline(&mut self.edit_vendor_buf.base_url)
+                .desired_width(f32::INFINITY)
+                .hint_text("https://api.example.com/v1")
+                .id_salt("vp_base"),
+        );
+        ui.add_space(8.0);
+
+        ui.label(RichText::new("API Key").size(11.5).color(color::TEXT_DIM));
+        ui.add(
+            TextEdit::singleline(&mut self.edit_vendor_buf.api_key)
+                .password(true)
+                .desired_width(f32::INFINITY)
+                .hint_text("sk-…")
+                .id_salt("vp_key"),
+        );
+        ui.add_space(8.0);
+
+        ui.label(RichText::new("默认模型").size(11.5).color(color::TEXT_DIM));
+        let models_busy = self
+            .vendor_models_task
+            .as_ref()
+            .is_some_and(|t| !t.done);
+        ui.horizontal(|ui| {
+            let btn_w = 108.0;
+            ui.add(
+                TextEdit::singleline(&mut self.edit_vendor_buf.model)
+                    .desired_width((ui.available_width() - btn_w - 6.0).max(80.0))
+                    .hint_text("模型 ID，例如 gpt-4o-mini")
+                    .id_salt("vp_model"),
+            );
+            if ui
+                .add_enabled(
+                    !models_busy,
+                    egui::Button::new(if models_busy {
+                        "⏳ 获取中…"
+                    } else {
+                        "📋  获取模型"
+                    }),
+                )
+                .on_hover_text(
+                    "GET {Base URL}/models（OpenAI 兼容）。\n\
+                     若已填写 API Key，将设置请求头：Authorization: Bearer <API Key>。",
+                )
+                .clicked()
+            {
+                want_fetch_models = true;
+            }
+        });
+        if !self.vendor_models_msg.is_empty() {
+            let c = if self.vendor_models_msg.starts_with('✓') {
+                color::SUCCESS
+            } else if self.vendor_models_msg.starts_with('✗') || self.vendor_models_msg.contains("失败") {
+                color::DANGER
+            } else {
+                color::TEXT_DIM
+            };
+            ui.label(RichText::new(&self.vendor_models_msg).color(c).size(11.5));
+        }
+        if models_busy {
+            dim_label(ui, "正在请求远端模型列表…");
+        }
+        if !self.vendor_models_list.is_empty() {
+            ui.add_space(4.0);
+            ui.label(RichText::new("筛选").size(11.5).color(color::TEXT_DIM));
+            ui.add(
+                TextEdit::singleline(&mut self.vendor_models_filter)
+                    .hint_text("输入关键字过滤模型 id")
+                    .desired_width(f32::INFINITY)
+                    .id_salt("vp_models_filter"),
+            );
+            let needle = self.vendor_models_filter.trim().to_lowercase();
+            let filtered: Vec<String> = self
+                .vendor_models_list
+                .iter()
+                .filter(|m| needle.is_empty() || m.to_lowercase().contains(&needle))
+                .cloned()
+                .collect();
+            let mut picked: Option<String> = None;
+            egui::ScrollArea::vertical()
+                .id_salt("vp_models_scroll")
+                .max_height(200.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for m in &filtered {
+                        let selected = self.edit_vendor_buf.model == *m;
+                        if ui.selectable_label(selected, m.as_str()).clicked() {
+                            picked = Some(m.clone());
+                        }
+                    }
+                });
+            if let Some(m) = picked {
+                self.edit_vendor_buf.model = m;
+            }
+        }
+
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        // 生成参数区
+        ui.label(RichText::new("生成参数").size(11.5).color(color::TEXT_FAINT));
+        ui.add_space(6.0);
+        ui.columns(3, |cols| {
+            cols[0].label(
+                RichText::new("Temperature").size(11.5).color(color::TEXT_DIM),
+            );
+            cols[0].add(
+                TextEdit::singleline(&mut self.edit_vendor_buf.temperature)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("0.7")
+                    .id_salt("vp_t"),
+            );
+            cols[1].label(
+                RichText::new("Max Tokens").size(11.5).color(color::TEXT_DIM),
+            );
+            cols[1].add(
+                TextEdit::singleline(&mut self.edit_vendor_buf.max_tokens)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("4096")
+                    .id_salt("vp_x"),
+            );
+            cols[2].label(
+                RichText::new("Thinking Budget").size(11.5).color(color::TEXT_DIM),
+            );
+            cols[2].add(
+                TextEdit::singleline(&mut self.edit_vendor_buf.thinking_budget)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("（可选）")
+                    .id_salt("vp_h"),
+            );
+        });
+
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        // 连接测试区
+        egui::Frame::default()
+            .fill(color::SURFACE_HI)
+            .stroke(Stroke::new(1.0, color::BORDER))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("连接测试").color(color::TEXT_DIM).size(11.5));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.vendor_test_task.is_some() {
+                            ui.add_enabled(false, egui::Button::new("⏳  测试中…"));
+                        } else if ui.button("🔌  测试连接").clicked() {
+                            want_test = true;
+                        }
+                    });
+                });
+                if !self.vendor_test_msg.is_empty() {
+                    let msg_color = if self.vendor_test_msg.starts_with('✓') {
+                        color::SUCCESS
+                    } else {
+                        color::DANGER
+                    };
+                    ui.label(
+                        RichText::new(&self.vendor_test_msg)
+                            .color(msg_color)
+                            .size(12.0),
+                    );
+                } else if self.vendor_test_task.is_none() {
+                    dim_label(ui, "点击「测试连接」向所选模型发起一次最小请求。");
+                }
+            });
+
+        ui.add_space(14.0);
+
+        // 操作按钮行
+        ui.horizontal(|ui| {
+            if ui
+                .add(egui::Button::new(RichText::new("💾  保存配置").strong()))
+                .clicked()
+            {
+                want_save = true;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("移除配置").color(color::DANGER),
+                        )
+                        .fill(color::SURFACE_HI),
+                    )
+                    .clicked()
+                {
+                    want_delete = true;
+                }
+            });
+        });
+
+        // 处理测试
+        if want_test {
+            let cfg = self.edit_vendor_buf.clone();
+            if cfg.base_url.trim().is_empty() || cfg.model.trim().is_empty() {
+                self.vendor_test_msg = "✗  请先填写 Base URL 与 Model".into();
+            } else {
+                self.vendor_test_msg.clear();
+                let model = cfg.model.clone();
+                self.vendor_test_task = Some(spawn_ping(cfg, model));
+            }
+        }
+
+        if want_fetch_models {
+            let cfg = self.edit_vendor_buf.clone();
+            if cfg.base_url.trim().is_empty() {
+                self.vendor_models_msg = "✗  请先填写 Base URL".into();
+            } else {
+                self.vendor_models_msg.clear();
+                self.vendor_models_task = Some(spawn_fetch_models(cfg));
+            }
+        }
+
+        // 处理保存
+        if want_save {
+            let buf = self.edit_vendor_buf.clone();
+            self.settings.vendors.insert(id.clone(), buf.clone());
+            if buf.is_configured() {
+                if self.settings.active_vendor.is_empty() {
+                    self.settings.active_vendor = id.clone();
+                }
+                if self.settings.writing_vendor.is_empty() {
+                    self.settings.writing_vendor = id.clone();
+                }
+                if self.settings.review_vendor.is_empty() {
+                    self.settings.review_vendor = id.clone();
+                }
+            }
+            if let Err(e) = self.paths.save_settings(&self.settings) {
+                self.status_message = format!("保存设置失败：{e}");
+            } else {
+                self.status_message = format!("已保存：{title}");
+            }
+        }
+
+        // 处理删除
+        if want_delete {
+            self.settings.vendors.remove(&id);
+            if self.settings.active_vendor == id {
+                self.settings.active_vendor.clear();
+            }
+            if self.settings.review_vendor == id {
+                self.settings.review_vendor.clear();
+            }
+            if self.settings.writing_vendor == id {
+                self.settings.writing_vendor.clear();
+            }
+            let _ = self.paths.save_settings(&self.settings);
+            self.status_message = format!("已移除：{title}");
+            self.selected_vendor_id = None;
+        }
     }
 
     fn ui_writing_llm_card(&mut self, ui: &mut egui::Ui) {
@@ -7194,67 +7925,6 @@ impl InkOsApp {
             });
     }
 
-    fn ui_vendor_grid(&mut self, ui: &mut egui::Ui) {
-        let mut to_open: Option<String> = None;
-        ui.columns(2, |cols| {
-            for (i, v) in VENDORS.iter().enumerate() {
-                let col = &mut cols[i % 2];
-                let configured = self
-                    .settings
-                    .vendors
-                    .get(v.id)
-                    .map(|c| c.is_configured())
-                    .unwrap_or(false);
-                if Self::vendor_card(col, v, configured) {
-                    to_open = Some(v.id.to_string());
-                }
-                col.add_space(8.0);
-            }
-        });
-        if let Some(id) = to_open {
-            self.open_vendor_editor(&id);
-        }
-    }
-
-    fn vendor_card(ui: &mut egui::Ui, v: &VendorPreset, configured: bool) -> bool {
-        let resp = egui::Frame::default()
-            .fill(color::SURFACE)
-            .stroke(Stroke::new(1.0, color::BORDER))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(Margin::symmetric(16, 14))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new(v.name).color(color::TEXT).size(14.0).strong(),
-                        );
-                        ui.add_space(2.0);
-                        let (lbl, c) = if configured {
-                            ("已配置", color::SUCCESS)
-                        } else {
-                            ("未配置", color::TEXT_FAINT)
-                        };
-                        ui.label(RichText::new(lbl).color(c).size(12.0));
-                        if !v.note.is_empty() {
-                            ui.label(RichText::new(v.note).color(color::TEXT_FAINT).size(10.5));
-                        }
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let dot = if configured { color::SUCCESS } else { color::TEXT_FAINT };
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                        ui.painter().circle_filled(rect.center(), 4.0, dot);
-                    });
-                });
-            })
-            .response
-            .interact(egui::Sense::click());
-        if resp.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        resp.clicked()
-    }
-
     fn open_vendor_editor(&mut self, id: &str) {
         let preset = find_vendor(id);
         let existing = self.settings.vendors.get(id).cloned();
@@ -7271,195 +7941,10 @@ impl InkOsApp {
         self.edit_vendor_id = Some(id.to_string());
         self.vendor_test_msg.clear();
         self.vendor_test_task = None;
-    }
-
-    fn show_vendor_editor(&mut self, ctx: &egui::Context) {
-        let Some(id) = self.edit_vendor_id.clone() else { return };
-        let preset = find_vendor(&id);
-        let title = preset.map(|p| p.name.to_string()).unwrap_or_else(|| id.clone());
-
-        let mut open = true;
-        let mut want_save = false;
-        let mut want_delete = false;
-        let mut want_close = false;
-        let mut want_test = false;
-
-        egui::Window::new(format!("配置：{title}"))
-            .open(&mut open)
-            .resizable(false)
-            .collapsible(false)
-            .default_width(540.0)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("Base URL").size(11.5).color(color::TEXT_DIM));
-                    ui.add(
-                        TextEdit::singleline(&mut self.edit_vendor_buf.base_url)
-                            .desired_width(f32::INFINITY)
-                            .id_salt("ed_base"),
-                    );
-                    ui.add_space(6.0);
-                    ui.label(RichText::new("API Key").size(11.5).color(color::TEXT_DIM));
-                    ui.add(
-                        TextEdit::singleline(&mut self.edit_vendor_buf.api_key)
-                            .password(true)
-                            .desired_width(f32::INFINITY)
-                            .id_salt("ed_key"),
-                    );
-                    ui.add_space(6.0);
-                    ui.label(RichText::new("Model").size(11.5).color(color::TEXT_DIM));
-                    ui.add(
-                        TextEdit::singleline(&mut self.edit_vendor_buf.model)
-                            .desired_width(f32::INFINITY)
-                            .id_salt("ed_model"),
-                    );
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new("Temperature").size(11.5).color(color::TEXT_DIM));
-                            ui.add(
-                                TextEdit::singleline(&mut self.edit_vendor_buf.temperature)
-                                    .desired_width(140.0)
-                                    .id_salt("ed_t"),
-                            );
-                        });
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new("Max Tokens").size(11.5).color(color::TEXT_DIM));
-                            ui.add(
-                                TextEdit::singleline(&mut self.edit_vendor_buf.max_tokens)
-                                    .desired_width(140.0)
-                                    .id_salt("ed_x"),
-                            );
-                        });
-                        ui.vertical(|ui| {
-                            ui.label(
-                                RichText::new("Thinking Budget").size(11.5).color(color::TEXT_DIM),
-                            );
-                            ui.add(
-                                TextEdit::singleline(&mut self.edit_vendor_buf.thinking_budget)
-                                    .desired_width(140.0)
-                                    .id_salt("ed_h"),
-                            );
-                        });
-                    });
-                    if let Some(p) = preset {
-                        if !p.note.is_empty() {
-                            ui.add_space(6.0);
-                            dim_label(ui, p.note);
-                        }
-                    }
-
-                    ui.add_space(10.0);
-                    egui::Frame::default()
-                        .fill(color::SURFACE_HI)
-                        .stroke(Stroke::new(1.0, color::BORDER))
-                        .corner_radius(CornerRadius::same(8))
-                        .inner_margin(Margin::symmetric(12, 8))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("连接测试").color(color::TEXT_DIM).size(11.5),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if self.vendor_test_task.is_some() {
-                                            ui.add_enabled(false, egui::Button::new("⏳  测试中…"));
-                                        } else if ui.button("🔌  测试连接").clicked() {
-                                            want_test = true;
-                                        }
-                                    },
-                                );
-                            });
-                            if !self.vendor_test_msg.is_empty() {
-                                let color = if self.vendor_test_msg.starts_with('✓') {
-                                    color::SUCCESS
-                                } else {
-                                    color::DANGER
-                                };
-                                ui.label(
-                                    RichText::new(&self.vendor_test_msg).color(color).size(12.0),
-                                );
-                            } else if self.vendor_test_task.is_none() {
-                                dim_label(ui, "点击「测试连接」会向所选模型发起一次最小请求。");
-                            }
-                        });
-
-                    ui.add_space(12.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("💾  保存").clicked() {
-                            want_save = true;
-                        }
-                        if ui.button("取消").clicked() {
-                            want_close = true;
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new("移除此服务商配置").color(color::DANGER),
-                                    )
-                                    .fill(color::SURFACE_HI),
-                                )
-                                .clicked()
-                            {
-                                want_delete = true;
-                            }
-                        });
-                    });
-                });
-            });
-
-        if want_test {
-            let cfg = self.edit_vendor_buf.clone();
-            if cfg.base_url.trim().is_empty() || cfg.model.trim().is_empty() {
-                self.vendor_test_msg = "✗  请先填写 Base URL 与 Model".into();
-            } else {
-                self.vendor_test_msg.clear();
-                let model = cfg.model.clone();
-                self.vendor_test_task = Some(spawn_ping(cfg, model));
-            }
-        }
-
-        if want_save {
-            let buf = self.edit_vendor_buf.clone();
-            self.settings.vendors.insert(id.clone(), buf.clone());
-            if buf.is_configured() {
-                if self.settings.active_vendor.is_empty() {
-                    self.settings.active_vendor = id.clone();
-                }
-                if self.settings.writing_vendor.is_empty() {
-                    self.settings.writing_vendor = id.clone();
-                }
-                if self.settings.review_vendor.is_empty() {
-                    self.settings.review_vendor = id.clone();
-                }
-            }
-            if let Err(e) = self.paths.save_settings(&self.settings) {
-                self.status_message = format!("保存设置失败：{e}");
-            } else {
-                self.status_message = format!("已保存：{title}");
-            }
-            self.edit_vendor_id = None;
-        } else if want_delete {
-            self.settings.vendors.remove(&id);
-            if self.settings.active_vendor == id {
-                self.settings.active_vendor.clear();
-            }
-            if self.settings.review_vendor == id {
-                self.settings.review_vendor.clear();
-            }
-            if self.settings.writing_vendor == id {
-                self.settings.writing_vendor.clear();
-            }
-            let _ = self.paths.save_settings(&self.settings);
-            self.status_message = format!("已移除：{title}");
-            self.edit_vendor_id = None;
-        } else if want_close || !open {
-            self.edit_vendor_id = None;
-        }
+        self.vendor_models_task = None;
+        self.vendor_models_msg.clear();
+        self.vendor_models_list.clear();
+        self.vendor_models_filter.clear();
     }
 
     fn ui_llm_form(ui: &mut egui::Ui, cfg: &mut LlmConfig, id: &str) {
