@@ -49,6 +49,10 @@ pub struct ChapterRecord {
     pub created_at: String,
     #[serde(default)]
     pub updated_at: String,
+    /// 本章节拍（Beats First Workflow）：先于正文生成 3-5 条短句，约束本章的关键推进点。
+    /// 通过 `#[serde(default)]` 兼容旧的 `project.json`（缺字段时为空 `Vec`）。
+    #[serde(default)]
+    pub beats: Vec<String>,
 }
 
 fn default_status() -> String {
@@ -203,6 +207,7 @@ impl ProjectStore {
             word_count: 0,
             created_at: now.clone(),
             updated_at: now,
+            beats: Vec::new(),
         });
         project.chapters.sort_by_key(|c| c.number);
         self.save_project(project)?;
@@ -238,6 +243,7 @@ impl ProjectStore {
         content: &str,
         status: &str,
         summary_override: &str,
+        beats: &[String],
     ) -> Result<()> {
         let idx = self.ensure_chapter(project, number, title)?;
         let chapter = &mut project.chapters[idx];
@@ -274,6 +280,11 @@ impl ProjectStore {
         if chapter.created_at.is_empty() {
             chapter.created_at = now;
         }
+        chapter.beats = beats
+            .iter()
+            .map(|b| b.trim().to_string())
+            .filter(|b| !b.is_empty())
+            .collect();
 
         self.save_project(project)?;
         Ok(())
@@ -495,6 +506,7 @@ impl ProjectStore {
                     word_count: count_story_units(&c) as i32,
                     created_at: mtime.clone(),
                     updated_at: mtime,
+                    beats: Vec::new(),
                 });
                 known.insert(num);
             }

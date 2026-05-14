@@ -1,6 +1,6 @@
 [package]
 name = "inkos_desktop"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2021"
 description = "InkOS 小说写作工作台（Rust + egui），与 inkoswin 目录/配置兼容；致敬 Narcooo/inkos"
 license = "MIT OR Apache-2.0"

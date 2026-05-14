@@ -102,13 +102,20 @@ enum StateSyncPhase {
     Running { chapter_no: i32 },
 }
 
-/// AI 顺序刷新 `story_state/`（对齐 inkoswin `_state_documents_worker`）。
+/// AI 批量刷新 `story_state/`（Phase 2：JSON Delta 模式）。
+///
+/// 单次 LLM 调用返回 `state_sync::StateSyncReport`，由 `state_sync::apply_updates`
+/// 应用到 `story_state/*.md`，避免 N 次"全量重写整文件"。
 struct StateRefreshBatch {
-    queue: Vec<String>,
-    index: usize,
+    /// 本次允许 LLM 修改的文件白名单（已剔除 chapter_summaries.md / book_rules.md）。
+    /// 用于 apply_updates 的 whitelist + 状态条/oplog 展示。
+    target_files: Vec<String>,
+    /// 用于 prompt 中"当前状态档案"段（已过 `filter_state_docs_by_beats` 过滤）。
     state_documents: HashMap<String, String>,
     chapter_digest: String,
     project_snapshot: NovelProject,
+    /// 用于 prompt 中"[本章节拍]"段（最新章节的 beats）。
+    beats: Vec<String>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -249,6 +256,15 @@ pub struct InkOsApp {
     /// 若当前章节已有正文需要二次确认覆盖，写入此字段；UI 渲染 modal 让用户确认。
     pending_gen_confirm: Option<i32>,
 
+    /// Beats First Workflow：当前章节的本章节拍（用户可增删改）。
+    /// 持久化在 `ChapterRecord.beats`，UI 这里维护一份可编辑副本。
+    chapter_beats: Vec<String>,
+    /// 节拍编辑是否有未保存改动（与 chapter_dirty / chapter_summary_dirty 并列）。
+    beats_dirty: bool,
+    /// 「AI 生成本章节拍」LLM 任务（与 manual_gen_task 隔离，互不阻塞）。
+    beats_gen_task: Option<LlmTask>,
+    beats_gen_target: Option<i32>,
+
     // 「AI 生成 book_rules.md」专用任务（对齐 Narcooo/inkos 的 architect.bookRulesPrompt）。
     // 与 manual_gen_task 隔离，避免与正文生成互相阻塞。
     book_rules_gen_task: Option<LlmTask>,
@@ -277,6 +293,10 @@ pub struct InkOsApp {
     pending_hooks_summary: Vec<String>,
     pending_hooks_mtime: Option<SystemTime>,
     pending_hooks_collapsed: bool,
+    /// 写作页「当前激活上下文」小组件折叠态。
+    context_radar_collapsed: bool,
+    /// 「伏笔追踪」悬浮窗开关。
+    hooks_tracker_open: bool,
 
     edit_vendor_id: Option<String>,
     edit_vendor_buf: VendorConfig,
@@ -424,6 +444,10 @@ impl InkOsApp {
             manual_gen_task: None,
             manual_gen_target: None,
             pending_gen_confirm: None,
+            chapter_beats: Vec::new(),
+            beats_dirty: false,
+            beats_gen_task: None,
+            beats_gen_target: None,
             book_rules_gen_task: None,
             pending_book_rules_confirm: false,
             pending_book_rules_sync_on_save: false,
@@ -441,6 +465,8 @@ impl InkOsApp {
             pending_hooks_summary: Vec::new(),
             pending_hooks_mtime: None,
             pending_hooks_collapsed: false,
+            context_radar_collapsed: false,
+            hooks_tracker_open: false,
             edit_vendor_id: None,
             edit_vendor_buf: VendorConfig::default(),
             vendor_test_task: None,
@@ -545,6 +571,10 @@ impl InkOsApp {
         self.manual_gen_task = None;
         self.manual_gen_target = None;
         self.pending_gen_confirm = None;
+        self.chapter_beats.clear();
+        self.beats_dirty = false;
+        self.beats_gen_task = None;
+        self.beats_gen_target = None;
         self.book_rules_gen_task = None;
         self.pending_book_rules_confirm = false;
         self.pending_book_rules_sync_on_save = false;
@@ -669,13 +699,16 @@ impl InkOsApp {
                     if let Some(rec) = p.chapters.iter().find(|c| c.number == n) {
                         self.chapter_status = rec.status.clone();
                         self.chapter_summary = rec.summary.clone();
+                        self.chapter_beats = rec.beats.clone();
                     } else {
                         self.chapter_status = "draft".into();
                         self.chapter_summary.clear();
+                        self.chapter_beats.clear();
                     }
                 }
                 self.chapter_dirty = false;
                 self.chapter_summary_dirty = false;
+                self.beats_dirty = false;
                 self.preview_md = self.chapter_body.clone();
                 self.preview_deadline = None;
             }
@@ -719,14 +752,17 @@ impl InkOsApp {
             &self.chapter_body,
             &self.chapter_status,
             &self.chapter_summary,
+            &self.chapter_beats,
         ) {
             Ok(()) => {
                 self.chapter_dirty = false;
                 self.chapter_summary_dirty = false;
+                self.beats_dirty = false;
                 self.preview_md = self.chapter_body.clone();
                 if let Some(ref p) = self.project {
                     if let Some(rec) = p.chapters.iter().find(|c| c.number == n) {
                         self.chapter_summary = rec.summary.clone();
+                        self.chapter_beats = rec.beats.clone();
                     }
                 }
                 self.status_message = format!("已保存第 {n} 章");
@@ -874,14 +910,14 @@ impl InkOsApp {
     /// 2) 无论 `auto_refresh_state_after_chapter_save` 如何，都尝试触发一次
     ///    「AI 刷新全部长期记忆档案」（前提检查不通过时会将原因写到 status + OpLog）。
     fn save_and_sync_memory(&mut self) {
-        let had_dirty = self.chapter_dirty || self.chapter_summary_dirty;
+        let had_dirty = self.chapter_dirty || self.chapter_summary_dirty || self.beats_dirty;
         let prev_auto = self.settings.auto_refresh_state_after_chapter_save;
         if had_dirty {
             // 临时关闭自动刷新，避免 save_current_chapter 里再触发一次（下面会统一走一条）。
             self.settings.auto_refresh_state_after_chapter_save = false;
             self.save_current_chapter();
             self.settings.auto_refresh_state_after_chapter_save = prev_auto;
-            if self.chapter_dirty || self.chapter_summary_dirty {
+            if self.chapter_dirty || self.chapter_summary_dirty || self.beats_dirty {
                 // 保存失败，状态栏已有提示，不再继续。
                 return;
             }
@@ -1012,6 +1048,9 @@ impl InkOsApp {
         if self.manual_gen_task.is_some() {
             return Some("请先完成或取消章节生成".into());
         }
+        if self.beats_gen_task.is_some() {
+            return Some("请先完成或取消节拍生成".into());
+        }
         if self.book_rules_gen_task.is_some() {
             return Some("请先完成或取消 book_rules 生成".into());
         }
@@ -1021,7 +1060,7 @@ impl InkOsApp {
         if self.auto_gen_task.is_some() {
             return Some("请先完成或取消定时写作".into());
         }
-        if self.chapter_dirty || self.chapter_summary_dirty {
+        if self.chapter_dirty || self.chapter_summary_dirty || self.beats_dirty {
             return Some("请先保存当前章节".into());
         }
         if self.state_doc_dirty {
@@ -1079,6 +1118,15 @@ impl InkOsApp {
         self.try_start_state_refresh(queue);
     }
 
+    /// Phase 2：批量 JSON Delta 刷新。`queue` 是用户请求要刷新的文件清单。
+    ///
+    /// 流程：
+    /// 1. 立即在本地重建 `chapter_summaries.md`（如果它在 queue 中）；
+    /// 2. 把 `target_files` 限制在 `STATE_DIR_FILENAMES` 内（排除 chapter_summaries / book_rules
+    ///    与 story/ 控制层文件，因为 `state_sync::apply_updates` 只写 story_state/）；
+    /// 3. 用最新章节的 beats 过滤注入给 LLM 的上下文（`filter_state_docs_by_beats`）；
+    /// 4. 1 次 spawn_chat（非流式，保证 JSON 完整）；
+    /// 5. `handle_state_refresh_task_done` 解析 JSON 并通过 `state_sync::apply_updates` 落盘。
     fn try_start_state_refresh(&mut self, queue: Vec<String>) {
         if let Some(msg) = self.state_refresh_prereq_reason() {
             self.status_message = msg;
@@ -1107,178 +1155,235 @@ impl InkOsApp {
             self.status_message = "未打开项目".into();
             return;
         };
+
+        // 1) 立即在本地重建 chapter_summaries.md（若在 queue 中）。
+        let need_local_summaries = queue.iter().any(|f| f == "chapter_summaries.md");
+        if need_local_summaries {
+            let body = store.build_chapter_summaries_document(&project_snapshot);
+            if let Err(e) = store.write_story_state_file("chapter_summaries.md", &body) {
+                self.status_message = format!("写入 chapter_summaries.md 失败：{e}");
+                return;
+            }
+            oplog::try_append(
+                self.novel_path.as_deref(),
+                "AI 刷新状态档案 · 本地重建",
+                "chapter_summaries.md（无 LLM 调用）",
+            );
+        }
+
+        // 2) 计算 target_files：仅 story_state/ 下、且非 chapter_summaries / book_rules。
+        let target_files: Vec<String> = queue
+            .iter()
+            .filter(|f| {
+                crate::state_refresh::STATE_DIR_FILENAMES
+                    .iter()
+                    .any(|s| *s == f.as_str())
+                    && *f != "chapter_summaries.md"
+                    && *f != "book_rules.md"
+            })
+            .cloned()
+            .collect();
+        let skipped_story: Vec<String> = queue
+            .iter()
+            .filter(|f| f.starts_with("story/"))
+            .cloned()
+            .collect();
+        if !skipped_story.is_empty() {
+            oplog::try_append(
+                self.novel_path.as_deref(),
+                "AI 刷新状态档案 · 跳过 story 控制层",
+                &skipped_story.join(", "),
+            );
+        }
+
+        // 3) 加载全量档案 + 最近 beats + 过滤上下文。
         let chapter_digest = store.build_chapter_digest(&project_snapshot, 12);
-        let state_documents = match self.load_state_refresh_documents_map(&project_snapshot) {
+        let state_documents_full = match self.load_state_refresh_documents_map(&project_snapshot) {
             Ok(m) => m,
             Err(e) => {
                 self.status_message = format!("载入状态档案失败：{e}");
                 return;
             }
         };
+        let beats = self.latest_chapter_beats();
+        let state_documents =
+            crate::state_refresh::filter_state_docs_by_beats(&state_documents_full, &beats);
+
+        // 4) 若白名单为空（如仅请求了 chapter_summaries.md），直接收尾。
+        if target_files.is_empty() {
+            oplog::try_append(
+                self.novel_path.as_deref(),
+                "AI 刷新状态档案 · 跳过 LLM",
+                "白名单为空（仅本地重建）",
+            );
+            self.state_refresh_batch = Some(StateRefreshBatch {
+                target_files: Vec::new(),
+                state_documents,
+                chapter_digest,
+                project_snapshot,
+                beats,
+            });
+            self.finish_state_refresh_batch_success();
+            return;
+        }
+
+        // 5) 构造 batched prompt + 1 次 spawn_chat（非流式）。
+        let target_refs: Vec<&str> = target_files.iter().map(|s| s.as_str()).collect();
+        let (system_prompt, user_prompt) = crate::state_refresh::build_batch_delta_prompts(
+            &project_snapshot,
+            &target_refs,
+            &state_documents,
+            &chapter_digest,
+            &beats,
+        );
 
         oplog::try_append(
             self.novel_path.as_deref(),
-            "AI 刷新状态档案 · 开始",
-            &queue.join(", "),
+            "AI 刷新状态档案 · 开始（批量 Delta）",
+            &target_files.join(", "),
         );
+
+        let n_targets = target_files.len();
         self.state_refresh_batch = Some(StateRefreshBatch {
-            queue,
-            index: 0,
+            target_files,
             state_documents,
             chapter_digest,
             project_snapshot,
+            beats,
         });
-        self.kick_state_refresh_step();
-    }
 
-    fn kick_state_refresh_step(&mut self) {
-        if self.state_refresh_task.is_some() {
-            return;
-        }
-        let Some(store) = self.store.as_ref() else {
-            self.abort_state_refresh("内部错误：无 ProjectStore");
-            return;
-        };
-
-        let done = self
-            .state_refresh_batch
-            .as_ref()
-            .map(|b| b.index >= b.queue.len())
-            .unwrap_or(true);
-        if done {
-            if self.state_refresh_batch.is_some() {
-                self.finish_state_refresh_batch_success();
-            }
-            return;
-        }
-
-        let fname = {
-            let b = self.state_refresh_batch.as_ref().unwrap();
-            b.queue[b.index].clone()
-        };
-
-        if fname == "chapter_summaries.md" {
-            let body = {
-                let snap = &self.state_refresh_batch.as_ref().unwrap().project_snapshot;
-                store.build_chapter_summaries_document(snap)
-            };
-            if let Err(e) = store.write_story_state_file("chapter_summaries.md", &body) {
-                self.abort_state_refresh(format!("写入 chapter_summaries.md 失败：{e}"));
-                return;
-            }
-            {
-                let b = self.state_refresh_batch.as_mut().unwrap();
-                b.state_documents.insert(fname.clone(), body);
-                b.index += 1;
-            }
-            oplog::try_append(
-                self.novel_path.as_deref(),
-                "AI 刷新状态档案 · 单文件",
-                &format!("{fname}（本地重建，未调用 LLM）"),
-            );
-            self.kick_state_refresh_step();
-            return;
-        }
-
-        let Some(spec) = crate::state_refresh::spec_for(&fname) else {
-            self.abort_state_refresh(format!("未知状态文件：{fname}"));
-            return;
-        };
-
-        let (system_prompt, user_prompt, idx_one_based, total) = {
-            let b = self.state_refresh_batch.as_ref().unwrap();
-            let current_content = b.state_documents.get(&fname).cloned().unwrap_or_default();
-            let (sys, user) = crate::state_refresh::build_state_document_prompts(
-                &b.project_snapshot,
-                spec,
-                &current_content,
-                &b.chapter_digest,
-                &b.state_documents,
-            );
-            (sys, user, b.index + 1, b.queue.len())
-        };
-
-        let vendor_id = self.settings.writing_vendor.clone();
-        let Some(cfg) = self.vendor_config(&vendor_id) else {
-            self.abort_state_refresh(format!("服务商「{vendor_id}」配置缺失"));
-            return;
-        };
-        if !cfg.is_configured() {
-            self.abort_state_refresh("写作 LLM 未完整配置");
-            return;
-        }
         let messages = vec![
             ChatMessage::system(&system_prompt),
             ChatMessage::user(user_prompt),
         ];
         let model = cfg.model.clone();
-        self.state_refresh_task = Some(spawn_chat(
-            cfg,
-            vendor_id,
-            model,
-            messages,
-            false,
-        ));
+        // 强制非流式：避免半截 JSON 解析失败
+        self.state_refresh_task = Some(spawn_chat(cfg, vendor_id, model, messages, false));
         self.status_message =
-            format!("🔄 AI 刷新档案：{fname}（{idx_one_based}/{total}）");
+            format!("🔄 AI 刷新状态档案中（批量 JSON Delta · {n_targets} 个目标文件）…");
+    }
+
+    /// 拿"最新章节"的 beats，用作刷档时的聚焦提示。
+    /// 优先 selected_chapter 的 beats（即 self.chapter_beats），否则取最大编号且有 beats 的章节。
+    fn latest_chapter_beats(&self) -> Vec<String> {
+        if !self.chapter_beats.is_empty() {
+            return self.chapter_beats.clone();
+        }
+        let Some(project) = self.project.as_ref() else {
+            return Vec::new();
+        };
+        let mut sorted: Vec<&crate::project::ChapterRecord> = project.chapters.iter().collect();
+        sorted.sort_by_key(|c| std::cmp::Reverse(c.number));
+        for c in sorted {
+            if !c.beats.is_empty() {
+                return c.beats.clone();
+            }
+        }
+        Vec::new()
     }
 
     fn handle_state_refresh_task_done(&mut self) {
         let Some(task) = self.state_refresh_task.take() else {
             return;
         };
-        let Some(fname) = self.state_refresh_batch.as_ref().and_then(|b| {
-            if b.index >= b.queue.len() {
-                None
-            } else {
-                Some(b.queue[b.index].clone())
-            }
-        }) else {
+        let Some(batch) = self.state_refresh_batch.as_ref() else {
             return;
         };
+        let target_files = batch.target_files.clone();
 
         if let Some(err) = task.error.clone() {
-            self.abort_state_refresh(format!("{fname}：{err}"));
+            self.abort_state_refresh(format!("批量刷档失败：{err}"));
             return;
         }
-        let raw = task.accumulated.trim();
+        let raw = task.accumulated.trim().to_string();
         if raw.is_empty() {
-            self.abort_state_refresh(format!("{fname}：模型返回为空"));
+            self.abort_state_refresh("模型返回为空");
             return;
         }
-        let cleaned = crate::state_refresh::sanitize_model_markdown(raw);
-        let skipped_write = self
-            .state_refresh_batch
-            .as_ref()
-            .and_then(|b| b.state_documents.get(&fname))
-            .map(|old| old.trim() == cleaned.trim())
-            .unwrap_or(false);
-        if !skipped_write {
-            if let Err(e) = self.write_state_refresh_file(&fname, &cleaned) {
-                self.abort_state_refresh(format!("写入 {fname} 失败：{e}"));
+        let report = match state_sync::parse_state_updates(&raw) {
+            Ok(r) => r,
+            Err(e) => {
+                self.abort_state_refresh(format!("JSON 解析失败：{e}"));
                 return;
             }
+        };
+
+        let Some(novel_root) = self.novel_path.clone() else {
+            self.abort_state_refresh("内部错误：无 novel_path");
+            return;
+        };
+        let Some(state_dir) = self.store.as_ref().map(|s| s.state_dir()) else {
+            self.abort_state_refresh("内部错误：无 state_dir");
+            return;
+        };
+        let whitelist_refs: Vec<&str> = target_files.iter().map(|s| s.as_str()).collect();
+        let changes: Vec<StateFileChange> =
+            state_sync::apply_updates(&novel_root, &state_dir, &report, &whitelist_refs);
+
+        let written_count = changes
+            .iter()
+            .filter(|c| c.new_chars != c.old_chars)
+            .count();
+        let summary_short = if report.summary.trim().is_empty() {
+            "（LLM 未给出摘要）".to_string()
+        } else {
+            report.summary.trim().chars().take(60).collect::<String>()
+        };
+        self.state_sync_log.push(format!(
+            "{}  刷档完成：{summary_short} · 实际改动 {} / 目标 {}",
+            short_time(),
+            written_count,
+            target_files.len()
+        ));
+        for change in &changes {
+            self.state_sync_log.push(format!(
+                "{}  · {} action={} 旧{}字→新{}字{}",
+                short_time(),
+                change.file,
+                change.action,
+                change.old_chars,
+                change.new_chars,
+                if change.note.is_empty() {
+                    String::new()
+                } else {
+                    format!("（{}）", change.note)
+                },
+            ));
         }
-        {
-            let b = self.state_refresh_batch.as_mut().unwrap();
-            b.state_documents.insert(fname.clone(), cleaned);
-            b.index += 1;
-        }
+
         oplog::try_append(
             self.novel_path.as_deref(),
-            "AI 刷新状态档案 · 单文件",
-            &format!("{fname}（LLM{}）", if skipped_write { "，内容无变化跳过写盘" } else { "" }),
+            "AI 刷新状态档案 · 完成（批量 Delta）",
+            &format!(
+                "{summary_short} · 改动 {} / 目标 {}",
+                written_count,
+                target_files.len()
+            ),
         );
-        self.kick_state_refresh_step();
+
+        // 更新 batch.state_documents 缓存（用磁盘上的最新内容覆盖）
+        for change in &changes {
+            if let Ok(text) = fs::read_to_string(state_dir.join(&change.file)) {
+                if let Some(b) = self.state_refresh_batch.as_mut() {
+                    b.state_documents.insert(change.file.clone(), text);
+                }
+            }
+        }
+
+        self.finish_state_refresh_batch_success();
     }
 
     fn finish_state_refresh_batch_success(&mut self) {
-        let queue: Vec<String> = self
+        let target_files: Vec<String> = self
             .state_refresh_batch
             .as_ref()
-            .map(|b| b.queue.clone())
+            .map(|b| b.target_files.clone())
             .unwrap_or_default();
-        let files_label = queue.join(", ");
+        let files_label = if target_files.is_empty() {
+            "（无 LLM 调用）".to_string()
+        } else {
+            target_files.join(", ")
+        };
         let selected = self.selected_state_file.clone();
 
         self.state_refresh_task = None;
@@ -1289,15 +1394,10 @@ impl InkOsApp {
                 self.project = Some(p);
             }
         }
-        if queue.iter().any(|f| f == &selected) {
+        if target_files.iter().any(|f| f == &selected) {
             self.load_state_doc();
         }
         self.status_message = format!("✓ 状态档案刷新完成：{files_label}");
-        oplog::try_append(
-            self.novel_path.as_deref(),
-            "AI 刷新状态档案 · 完成",
-            &files_label,
-        );
         self.refresh_pending_hooks();
 
         // 若之前「生成下一章」被刷新任务挂起，则此时恢复生成。
@@ -1425,6 +1525,7 @@ impl eframe::App for InkOsApp {
         self.show_gen_confirm_modal(ctx);
         self.show_book_rules_confirm_modal(ctx);
         self.show_novel_wizard(ctx);
+        self.show_hooks_tracker_window(ctx);
     }
 }
 
@@ -1559,6 +1660,14 @@ impl InkOsApp {
                 self.chapter_body = result.content;
                 // 流式阶段的摘要只做预览，不覆盖用户未保存摘要（避免抖动）；完成时再一次性写入。
                 self.preview_md = self.chapter_body.clone();
+            }
+        }
+        if let Some(task) = &mut self.beats_gen_task {
+            task.drain();
+            if task.done {
+                self.handle_beats_gen_done();
+            } else {
+                any_running = true;
             }
         }
         if let Some(task) = &mut self.book_rules_gen_task {
@@ -2331,7 +2440,7 @@ impl InkOsApp {
                         .on_hover_text(
                             "保存当前章节 → 立即触发「AI 刷新全部长期记忆档案」：\n\
                              · 避免「生成下一章」的[连续性档案]滞后于实际章节推进\n\
-                             · 会消耗 7 次写作 LLM 调用（book_rules.md 不动，chapter_summaries 本地重建）\n\
+                             · 会消耗 1 次写作 LLM 调用（批量 JSON Delta；book_rules.md 不动，chapter_summaries 本地重建）\n\
                              · 章节正文仍以本次保存为准，不会自动修改",
                         );
                     if sync_btn.clicked() {
@@ -2339,6 +2448,23 @@ impl InkOsApp {
                     }
                     if ui.button("➕  新建下一章").clicked() {
                         self.new_chapter();
+                    }
+
+                    // 🪝 伏笔追踪：悬浮窗开关
+                    let hooks_label = if self.hooks_tracker_open {
+                        "🪝  关闭伏笔追踪"
+                    } else {
+                        "🪝  伏笔追踪"
+                    };
+                    if ui
+                        .button(hooks_label)
+                        .on_hover_text("打开伏笔追踪悬浮窗：实时查看 pending_hooks.md 中的未闭合条目，高亮风险词")
+                        .clicked()
+                    {
+                        self.hooks_tracker_open = !self.hooks_tracker_open;
+                        if self.hooks_tracker_open {
+                            self.refresh_pending_hooks();
+                        }
                     }
 
                     let running = self.manual_gen_task.is_some();
@@ -2349,6 +2475,16 @@ impl InkOsApp {
                             .clicked()
                         {
                             self.cancel_manual_chapter_generation();
+                        }
+                        if ui
+                            .button("🛑  停止并保存")
+                            .on_hover_text(
+                                "立即停止 AI 生成并把当前已收到的内容落盘到磁盘\n\
+                                 （等同：取消生成 → 标记 dirty → 保存当前章节）",
+                            )
+                            .clicked()
+                        {
+                            self.stop_manual_gen_and_save();
                         }
                         let running_n = self.manual_gen_target.unwrap_or(0);
                         theme::pill(
@@ -2400,7 +2536,7 @@ impl InkOsApp {
                             }
                         }
                     }
-                    if self.chapter_dirty || self.chapter_summary_dirty {
+                    if self.chapter_dirty || self.chapter_summary_dirty || self.beats_dirty {
                         theme::pill(ui, "未保存", Color32::WHITE, color::WARNING);
                     }
                 });
@@ -2491,6 +2627,12 @@ impl InkOsApp {
         });
 
         ui.add_space(8.0);
+        self.ui_chapter_beats_card(ui);
+
+        ui.add_space(8.0);
+        self.ui_context_radar(ui);
+
+        ui.add_space(8.0);
         let avail_h = ui.available_height();
         ui.allocate_ui(egui::vec2(ui.available_width(), avail_h), |ui| {
             ui.columns(2, |cols| {
@@ -2504,6 +2646,331 @@ impl InkOsApp {
                 Self::writing_pane_preview(&mut cols[1], &self.preview_md, &mut self.cm_cache);
             });
         });
+    }
+
+    /// Beats First Workflow 的「本章节拍」卡片：
+    /// - 上方按钮：✨ 生成节拍 / ⏹ 取消 / ➕ 添加；
+    /// - 下方列表：每条节拍一个 `TextEdit::singleline` + ✕ 删除按钮（用 `to_delete` 索引在
+    ///   循环外 mutate，规避 borrow checker）。
+    fn ui_chapter_beats_card(&mut self, ui: &mut egui::Ui) {
+        theme::card_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("本章节拍")
+                        .size(11.5)
+                        .color(color::TEXT_DIM),
+                );
+                ui.label(
+                    RichText::new(format!("（{} 条 · 写正文前先定，3-5 条最佳）", self.chapter_beats.len()))
+                        .size(11.0)
+                        .color(color::TEXT_FAINT),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let running = self.beats_gen_task.is_some();
+                    if running {
+                        if ui
+                            .button("⏹  取消生成")
+                            .on_hover_text("取消当前 AI 节拍生成")
+                            .clicked()
+                        {
+                            self.cancel_beats_generation();
+                        }
+                        theme::pill(ui, "节拍生成中", Color32::WHITE, color::ACCENT_HI);
+                    } else {
+                        let gen_btn = ui
+                            .button("✨  生成节拍")
+                            .on_hover_text(
+                                "基于小说设定 + 最近章节摘要，让 AI 写 3-5 条本章节拍；\
+                                 生成完成后填入下方列表，需手动确认/编辑后保存。",
+                            );
+                        if gen_btn.clicked() {
+                            if let Some(n) = self.selected_chapter {
+                                self.start_beats_generation(n);
+                            } else {
+                                self.status_message = "请先选择章节".into();
+                            }
+                        }
+                        if ui
+                            .button("➕  添加")
+                            .on_hover_text("追加一条空白节拍")
+                            .clicked()
+                        {
+                            self.chapter_beats.push(String::new());
+                            self.beats_dirty = true;
+                        }
+                    }
+                    if self.beats_dirty {
+                        theme::pill(ui, "未保存", Color32::WHITE, color::WARNING);
+                    }
+                });
+            });
+
+            ui.add_space(6.0);
+
+            if self.chapter_beats.is_empty() {
+                ui.label(
+                    RichText::new("暂无节拍。点击「✨ 生成节拍」让 AI 起草，或「➕ 添加」手动写入。")
+                        .size(11.5)
+                        .color(color::TEXT_FAINT),
+                );
+                return;
+            }
+
+            // 用 to_delete 索引规避 borrow checker：循环里只 mutate 当前 String + 局部 flag，
+            // 循环外再执行 remove / set dirty。
+            // iter_mut 拿到的 `beat: &mut String` 不与 `any_changed`、`to_delete` 冲突，
+            // `self.chapter_beats` 在整个 for 循环结束前不会被再次借用。
+            let mut to_delete: Option<usize> = None;
+            let mut any_changed = false;
+            for (i, beat) in self.chapter_beats.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{}.", i + 1))
+                            .size(11.5)
+                            .color(color::TEXT_DIM),
+                    );
+                    let r = ui.add(
+                        TextEdit::singleline(beat)
+                            .desired_width(ui.available_width() - 36.0)
+                            .hint_text("一句话描述本章关键推进点（16-40 字）")
+                            .id_salt(("ch_beat", i)),
+                    );
+                    if r.changed() {
+                        any_changed = true;
+                    }
+                    if ui
+                        .small_button("✕")
+                        .on_hover_text("删除这条节拍")
+                        .clicked()
+                    {
+                        to_delete = Some(i);
+                    }
+                });
+            }
+
+            if any_changed {
+                self.beats_dirty = true;
+            }
+            if let Some(i) = to_delete {
+                if i < self.chapter_beats.len() {
+                    self.chapter_beats.remove(i);
+                    self.beats_dirty = true;
+                }
+            }
+        });
+    }
+
+    /// 写作页「当前激活上下文」小组件。
+    ///
+    /// 显示本次 AI 写作 / 状态刷新会读取的状态档案清单（按 beats 过滤后的结果）。
+    /// Beats 为空时回退到全量列表。
+    fn ui_context_radar(&mut self, ui: &mut egui::Ui) {
+        // 先克隆 beats，避免后续与 &mut self 冲突。
+        let beats = self.chapter_beats.clone();
+
+        // 读取项目 + 加载档案。失败则给出 placeholder。
+        let docs_opt: Option<HashMap<String, String>> = self
+            .project
+            .as_ref()
+            .and_then(|p| self.load_state_refresh_documents_map(p).ok());
+
+        theme::card_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("📡 当前激活上下文")
+                        .color(theme::color::TEXT)
+                        .strong()
+                        .size(14.0),
+                );
+                ui.label(
+                    egui::RichText::new("（按本章节拍过滤；点击可展开全量档案）")
+                        .color(theme::color::TEXT_DIM)
+                        .size(11.5),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let label = if self.context_radar_collapsed {
+                        "▸ 展开"
+                    } else {
+                        "▾ 折叠"
+                    };
+                    if ui.small_button(label).clicked() {
+                        self.context_radar_collapsed = !self.context_radar_collapsed;
+                    }
+                });
+            });
+
+            if self.context_radar_collapsed {
+                return;
+            }
+
+            let Some(docs) = docs_opt else {
+                theme::dim_label(ui, "（未打开项目或档案加载失败）");
+                return;
+            };
+
+            let filtered = crate::state_refresh::filter_state_docs_by_beats(&docs, &beats);
+            let total_count = docs.len();
+            let active_count = filtered.len();
+
+            // 排序后展示 pills。
+            let mut names: Vec<&String> = filtered.keys().collect();
+            names.sort();
+
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.spacing_mut().item_spacing.y = 6.0;
+                if names.is_empty() {
+                    theme::dim_label(ui, "（无可用档案）");
+                } else {
+                    for name in names {
+                        let title = crate::state_refresh::spec_for(name)
+                            .map(|s| s.title)
+                            .unwrap_or(name.as_str());
+                        let body = filtered.get(name).map(String::as_str).unwrap_or("");
+                        let preview: String = body
+                            .trim()
+                            .chars()
+                            .take(200)
+                            .collect::<String>();
+                        let pill_text = format!("{name} · {title}");
+                        let resp = egui::Frame::default()
+                            .fill(theme::color::SURFACE_HI)
+                            .stroke(Stroke::new(1.0, theme::color::BORDER_HI))
+                            .corner_radius(CornerRadius::same(255))
+                            .inner_margin(Margin::symmetric(10, 4))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(&pill_text)
+                                        .color(theme::color::TEXT)
+                                        .size(11.5),
+                                );
+                            });
+                        let r = resp.response.interact(egui::Sense::hover());
+                        if !preview.is_empty() {
+                            r.on_hover_text(preview);
+                        }
+                    }
+                }
+            });
+
+            ui.add_space(6.0);
+            let foot = if beats.is_empty() {
+                format!(
+                    "Beats 为空，已回退到全量 {} 个档案；填写节拍后将自动按关键词过滤。",
+                    total_count
+                )
+            } else {
+                format!(
+                    "已过滤：{active_count}/{total_count} 个档案被注入到 AI 上下文（核心档案恒注入）。"
+                )
+            };
+            theme::dim_label(ui, &foot);
+        });
+    }
+
+    /// 「伏笔追踪」悬浮窗：读取 `pending_hooks.md` 摘要并高亮风险条目。
+    fn show_hooks_tracker_window(&mut self, ctx: &egui::Context) {
+        if !self.hooks_tracker_open {
+            return;
+        }
+        let mut open = self.hooks_tracker_open;
+        // 先克隆，避免与 &mut self 借用冲突。
+        let summary = self.pending_hooks_summary.clone();
+        let mtime_text = self
+            .pending_hooks_mtime
+            .as_ref()
+            .map(|t| {
+                let now = SystemTime::now();
+                match now.duration_since(*t) {
+                    Ok(d) => {
+                        let secs = d.as_secs();
+                        if secs < 60 {
+                            format!("{secs} 秒前")
+                        } else if secs < 3600 {
+                            format!("{} 分钟前", secs / 60)
+                        } else if secs < 86_400 {
+                            format!("{} 小时前", secs / 3600)
+                        } else {
+                            format!("{} 天前", secs / 86_400)
+                        }
+                    }
+                    Err(_) => "刚刚".to_string(),
+                }
+            })
+            .unwrap_or_else(|| "未读取".to_string());
+
+        let mut clicked_refresh = false;
+        let mut clicked_goto = false;
+
+        egui::Window::new("🪝 伏笔追踪")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(380.0)
+            .default_height(420.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("🔄 刷新").on_hover_text("重新读取 pending_hooks.md").clicked() {
+                        clicked_refresh = true;
+                    }
+                    if ui
+                        .button("📂 打开 pending_hooks.md")
+                        .on_hover_text("跳转到档案页查看完整内容")
+                        .clicked()
+                    {
+                        clicked_goto = true;
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(format!(
+                        "共 {} 条 · 最后更新 {}",
+                        summary.len(),
+                        mtime_text
+                    ))
+                    .color(theme::color::TEXT_DIM)
+                    .size(12.0),
+                );
+                ui.separator();
+
+                let warn_keywords =
+                    ["停滞", "风险", "紧迫", "必须", "未兑现", "逾期", "悬而未决"];
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if summary.is_empty() {
+                            theme::dim_label(
+                                ui,
+                                "（pending_hooks.md 为空，或文件不存在；点击「刷新」重试）",
+                            );
+                        } else {
+                            for (i, line) in summary.iter().enumerate() {
+                                let is_warn =
+                                    warn_keywords.iter().any(|k| line.contains(*k));
+                                let mut rt = egui::RichText::new(format!("{}. {}", i + 1, line))
+                                    .size(12.5);
+                                if is_warn {
+                                    rt = rt.color(theme::color::WARNING).strong();
+                                } else {
+                                    rt = rt.color(theme::color::TEXT);
+                                }
+                                ui.label(rt);
+                                ui.add_space(2.0);
+                            }
+                        }
+                    });
+            });
+
+        self.hooks_tracker_open = open;
+        if clicked_refresh {
+            self.refresh_pending_hooks();
+        }
+        if clicked_goto {
+            self.section = Section::NovelMeta;
+            self.nm_tab = NovelMetaTab::StateDocs;
+            self.selected_state_file = "pending_hooks.md".to_string();
+            self.load_state_doc();
+        }
     }
 
     fn ui_foreshadow_card(&mut self, ui: &mut egui::Ui) {
@@ -3169,11 +3636,11 @@ impl InkOsApp {
         let new_body = self.history_selected_body.clone();
         let novel_root = self.novel_path.clone();
         let (Some(store), Some(project)) = (&self.store, &mut self.project) else { return };
-        let cur_title = project
+        let (cur_title, cur_beats) = project
             .chapters
             .iter()
             .find(|c| c.number == n)
-            .map(|c| c.title.clone())
+            .map(|c| (c.title.clone(), c.beats.clone()))
             .unwrap_or_default();
         let old_body = store.load_chapter_content(n).map(|(_, b)| b).unwrap_or_default();
 
@@ -3188,7 +3655,7 @@ impl InkOsApp {
                 "恢复历史版本前自动备份当前内容",
             );
         }
-        match store.save_chapter(project, n, &cur_title, &new_body, "review", "") {
+        match store.save_chapter(project, n, &cur_title, &new_body, "review", "", &cur_beats) {
             Ok(()) => {
                 self.status_message = format!("已恢复第 {n} 章历史版本");
                 oplog::try_append(
@@ -4187,11 +4654,11 @@ impl InkOsApp {
         }
         let novel_root = self.novel_path.clone();
         let (Some(store), Some(project)) = (&self.store, &mut self.project) else { return };
-        let cur_title = project
+        let (cur_title, cur_beats) = project
             .chapters
             .iter()
             .find(|c| c.number == n)
-            .map(|c| c.title.clone())
+            .map(|c| (c.title.clone(), c.beats.clone()))
             .unwrap_or_default();
         let old_body = if !self.review_target_original.is_empty() {
             self.review_target_original.clone()
@@ -4230,7 +4697,7 @@ impl InkOsApp {
             }
         }
 
-        let save_result = store.save_chapter(project, n, &cur_title, &new_body, "review", "");
+        let save_result = store.save_chapter(project, n, &cur_title, &new_body, "review", "", &cur_beats);
         match save_result {
             Ok(()) => {
                 self.status_message = format!("已用 AI 改写替换第 {n} 章正文（状态置为待审核）");
@@ -4894,6 +5361,151 @@ impl InkOsApp {
         );
     }
 
+    /// Beats First Workflow：触发「AI 生成本章节拍」。
+    ///
+    /// 结构对照 `start_book_rules_generation`：先 clone project 脱钩 `&self.project`，
+    /// 再走 `inkoswin_prompt::build_beats_prompts` + `spawn_chat`。不会阻塞 egui 主线程。
+    fn start_beats_generation(&mut self, target_n: i32) {
+        if self.beats_gen_task.is_some() {
+            self.status_message = "已有节拍生成任务在进行中".into();
+            return;
+        }
+        // 用与「生成本章」一致的写作 LLM 配置（节拍同属写作管线第一步）。
+        let vendor_id = self.settings.writing_vendor.clone();
+        if vendor_id.is_empty() {
+            self.status_message = "未选择写作 LLM（设置 → 写作）".into();
+            return;
+        }
+        let Some(cfg) = self.vendor_config(&vendor_id) else {
+            self.status_message = format!("服务商「{vendor_id}」配置缺失");
+            return;
+        };
+        if !cfg.is_configured() {
+            self.status_message = "写作 LLM 服务商未完整配置".into();
+            return;
+        }
+
+        let Some(project_ref) = self.project.as_ref() else {
+            self.status_message = "未打开项目".into();
+            return;
+        };
+        let Some(store) = self.store.as_ref() else {
+            self.status_message = "项目存储未就绪".into();
+            return;
+        };
+        let project_snapshot = project_ref.clone();
+
+        // target chapter：若 project 里还不存在，造一个占位记录用于 prompt 中的标题/编号占位。
+        let target_chapter = project::ProjectStore::get_chapter(&project_snapshot, target_n)
+            .cloned()
+            .unwrap_or_else(|| crate::project::ChapterRecord {
+                number: target_n,
+                title: if !self.chapter_title.trim().is_empty() {
+                    self.chapter_title.trim().to_string()
+                } else {
+                    format!("第{target_n}章")
+                },
+                summary: self.chapter_summary.trim().to_string(),
+                status: "draft".into(),
+                word_count: 0,
+                created_at: crate::project::now_iso(),
+                updated_at: crate::project::now_iso(),
+                beats: Vec::new(),
+            });
+
+        // previous_materials：target 之前、正文非空的章节，按 number 升序（节拍只需摘要，但 prompt
+        // 内部会自行截取最近 12 章摘要，结构与 build_generation_prompts 对齐）。
+        let mut previous_materials: Vec<(crate::project::ChapterRecord, String)> = Vec::new();
+        let mut sorted: Vec<&crate::project::ChapterRecord> =
+            project_snapshot.chapters.iter().collect();
+        sorted.sort_by_key(|c| c.number);
+        for ch in sorted {
+            if ch.number >= target_n {
+                break;
+            }
+            if let Ok((_t, body)) = store.load_chapter_content(ch.number) {
+                if !body.trim().is_empty() {
+                    previous_materials.push((ch.clone(), body));
+                }
+            }
+        }
+
+        let (system_prompt, user_prompt) = inkoswin_prompt::build_beats_prompts(
+            &project_snapshot,
+            &target_chapter,
+            &previous_materials,
+        );
+        let messages = vec![
+            ChatMessage::system(&system_prompt),
+            ChatMessage::user(user_prompt),
+        ];
+        let model = cfg.model.clone();
+        let streaming = self.settings.writing_streaming;
+        self.beats_gen_task = Some(spawn_chat(cfg, vendor_id, model, messages, streaming));
+        self.beats_gen_target = Some(target_n);
+        self.status_message = format!("✨ 正在为第 {target_n} 章生成节拍…");
+        oplog::try_append(
+            self.novel_path.as_deref(),
+            "AI 生成本章节拍 · 开始",
+            &format!("第 {target_n} 章"),
+        );
+    }
+
+    fn cancel_beats_generation(&mut self) {
+        if self.beats_gen_task.is_none() {
+            return;
+        }
+        let n = self.beats_gen_target.unwrap_or(0);
+        self.beats_gen_task = None;
+        self.beats_gen_target = None;
+        self.status_message = if n > 0 {
+            format!("已取消第 {n} 章节拍生成")
+        } else {
+            "已取消节拍生成".into()
+        };
+        oplog::try_append(
+            self.novel_path.as_deref(),
+            "AI 生成本章节拍 · 取消",
+            &format!("第 {n} 章"),
+        );
+    }
+
+    fn handle_beats_gen_done(&mut self) {
+        let Some(task) = self.beats_gen_task.take() else { return };
+        let target_n = self.beats_gen_target.take().unwrap_or(0);
+        if let Some(err) = task.error.clone() {
+            self.status_message = format!("✗ 节拍生成失败：{err}");
+            oplog::try_append(
+                self.novel_path.as_deref(),
+                "AI 生成本章节拍 · 失败",
+                &err,
+            );
+            return;
+        }
+        let raw = task.accumulated.trim().to_string();
+        if raw.is_empty() {
+            self.status_message = "节拍生成结果为空".into();
+            return;
+        }
+        let beats = inkoswin_prompt::parse_beats_output(&raw);
+        if beats.is_empty() {
+            self.status_message = "节拍解析失败（未能从输出中提取到任何节拍）".into();
+            return;
+        }
+        self.chapter_beats = beats;
+        self.beats_dirty = true;
+        self.status_message = format!(
+            "✓ 第 {target_n} 章节拍已生成（{} 条 · {:.1}s），请核对后保存",
+            self.chapter_beats.len(),
+            task.elapsed_secs()
+        );
+        oplog::try_append(
+            self.novel_path.as_deref(),
+            "AI 生成本章节拍 · 完成",
+            &format!("第 {target_n} 章 · {} 条", self.chapter_beats.len()),
+        );
+    }
+
     /// 手动「AI 生成本章」（对齐 inkoswin `generate_current_chapter` + `build_generation_prompts`）。
     ///
     /// - Prompt 主体严格沿用 inkoswin：小说设定 / 前文摘要 / 最近 3 章节选 / 连续性档案 / 当前草稿 / 输出格式；
@@ -4954,6 +5566,7 @@ impl InkOsApp {
                 word_count: 0,
                 created_at: crate::project::now_iso(),
                 updated_at: crate::project::now_iso(),
+                beats: self.chapter_beats.clone(),
             });
 
         // 2. previous_materials：target 之前、正文非空的章节，按 number 升序。
@@ -4987,13 +5600,21 @@ impl InkOsApp {
         // 4. current_draft：编辑器里的当前正文
         let current_draft = self.chapter_body.clone();
 
-        // 5. 构造主体 prompt（inkoswin 原版）
+        // 5. Beats First Workflow：按本章节拍过滤档案 + 注入 [本章节拍] 段。
+        //    - beats 非空时：filter_state_docs_by_beats 只保留 5 个核心档案 + 关键词命中的条件档案；
+        //    - beats 为空时：透传完整 state_docs，行为与旧版本一致。
+        let beats = self.chapter_beats.clone();
+        let filtered_state_docs =
+            crate::state_refresh::filter_state_docs_by_beats(&state_docs, &beats);
+
+        // 6. 构造主体 prompt（inkoswin 原版 + Beats 注入）
         let (system_prompt, mut user_prompt) = inkoswin_prompt::build_generation_prompts(
             &project_snapshot,
             &target_chapter,
             &previous_materials,
+            &beats,
             &current_draft,
-            &state_docs,
+            &filtered_state_docs,
         );
 
         // 6. 桌面端扩展（可选增强，不影响核心对齐）：story 控制层 + 上一章审计 + 字数治理提醒
@@ -5060,9 +5681,9 @@ impl InkOsApp {
         }
         // 若当前章节有未保存改动，先保存。保存成功后可能触发「章节保存后自动刷新长期记忆」，
         // 若发生则把实际生成动作挂起到刷新完成后，避免下一章用到过期的 [连续性档案]。
-        if self.chapter_dirty || self.chapter_summary_dirty {
+        if self.chapter_dirty || self.chapter_summary_dirty || self.beats_dirty {
             self.save_current_chapter();
-            if self.chapter_dirty || self.chapter_summary_dirty {
+            if self.chapter_dirty || self.chapter_summary_dirty || self.beats_dirty {
                 return;
             }
         }
@@ -5139,6 +5760,22 @@ impl InkOsApp {
             self.novel_path.as_deref(),
             "AI 生成本章 · 取消",
             &format!("第 {n} 章"),
+        );
+    }
+
+    /// 流式期间「🛑 停止并保存」：
+    /// 1) 取消当前 AI 生成任务（已接收到的流式内容保留在 chapter_body）；
+    /// 2) 强制把 chapter_dirty 置 true（流式 drain 默认不会 set dirty）；
+    /// 3) 调 save_current_chapter 立即落盘。
+    fn stop_manual_gen_and_save(&mut self) {
+        let n = self.manual_gen_target.unwrap_or(0);
+        self.cancel_manual_chapter_generation();
+        self.chapter_dirty = true;
+        self.save_current_chapter();
+        oplog::try_append(
+            self.novel_path.as_deref(),
+            "AI 生成本章 · 停止并保存",
+            &format!("第 {n} 章（已落盘已接收内容）"),
         );
     }
 
@@ -5443,7 +6080,13 @@ impl InkOsApp {
                 let summary = self.normalize_generated_summary(&result.summary, &body);
                 let novel_root = self.novel_path.clone();
                 let (Some(store), Some(project)) = (&self.store, &mut self.project) else { return };
-                match store.save_chapter(project, n, &title, &body, "generated", &summary) {
+                let cur_beats = project
+                    .chapters
+                    .iter()
+                    .find(|c| c.number == n)
+                    .map(|c| c.beats.clone())
+                    .unwrap_or_default();
+                match store.save_chapter(project, n, &title, &body, "generated", &summary, &cur_beats) {
                     Ok(()) => {
                         project.auto_generate.last_run_at = crate::project::now_iso();
                         let _ = store.save_project(project);

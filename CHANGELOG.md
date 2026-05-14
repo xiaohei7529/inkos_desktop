@@ -4,6 +4,44 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [0.3.0] - 2026-05-14
+
+主题：**Beats First 写作流 + 批量 JSON Delta 刷档 + 写作页 Dashboard**。本版本把写作前置规划、长期记忆刷新、写作页态势感知三件事整体打通，AI 写作时的「注意力分散」和档案刷新的「重而慢」两大痛点同时收敛。
+
+### 新增
+
+- **Beats First Workflow（本章节拍层）**：
+  - `ChapterRecord` 新增 `beats: Vec<String>` 字段，并通过 `#[serde(default)]` 完全兼容旧版 `project.json`。
+  - 写作页新增「✨ 生成节拍」卡片：根据小说设定 + 前文摘要 + 全书大纲，单次调用 LLM 产出 3-5 条本章短句要点；支持手动增/删/改，所有改动自动随章节落盘。
+  - 写作 Prompt（`inkoswin_prompt::build_generation_prompts`）注入 `[本章节拍]` 段，并新增写作硬约束「必须依次推进上方[本章节拍]的每条节拍」，让生成更贴合用户已确认的故事推进点。
+- **JSON Delta 批量刷档**：
+  - `state_refresh::build_batch_delta_prompts`：与「保存并同步记忆」同构的 system prompt，要求 LLM 输出单个 JSON `{summary, updates[]}`，`action` 支持 `replace` 与 `patch`（后者使用 `===REPLACE_BLOCK===/===WITH===/===END===` 分隔符）。
+  - 写作侧 `try_start_state_refresh` 由「N 次全量 Markdown 重写」改为「1 次 spawn_chat + `state_sync::apply_updates` 落盘」，原 `kick_state_refresh_step` 已删除。
+  - 自动按最新章节 beats 调用 `filter_state_docs_by_beats` 过滤注入上下文，未涉及的档案不再塞进 prompt（核心档案 `outline.md / novel_brief.md / chapter_summaries.md / book_rules.md` 恒注入）。
+  - `chapter_summaries.md` 在刷档开始时**立即在本地重建**，不再消耗一次 LLM 调用。
+- **写作页 Dashboard 三件套**：
+  - 「📡 当前激活上下文」小组件：在节拍卡片之后显示本次 AI 会读取的状态档案 pill 列表（按 beats 过滤后），hover 显示前 200 字预览；Beats 为空时回退到全量列表。可折叠。
+  - 「🪝 伏笔追踪」悬浮窗：工具栏 toggle 打开，自定义大小，列出 `pending_hooks.md` 摘要并对「停滞 / 风险 / 紧迫 / 必须 / 未兑现 / 逾期 / 悬而未决」等关键词高亮加粗；支持一键刷新与跳转到档案页编辑。
+  - 流式生成中的「🛑 停止并保存」按钮：立即停止 AI 生成、强制标记 dirty 并把已收到的内容落盘到磁盘，避免「写一半中断 → 内容丢失」。
+- **单元测试**：
+  - `inkoswin_prompt::beats_parse_*` 系列共 3 条，覆盖节拍解析的常见前缀剥离、5 条上限、忽略空行/围栏。
+  - `state_refresh::filter_*` 共 3 条，覆盖空 beats 回退全量、核心档案恒注入、命中关键词时按需注入条件档案。
+  - `state_refresh::batch_delta_prompt_*` 共 2 条，覆盖白名单与 `book_rules.md / chapter_summaries.md` 禁止列表、`[本章节拍]` 段注入。
+
+### 优化
+
+- 刷档调用次数由「`REFRESH_ALL_ORDER` 中每个文件 1 次 LLM」改为 **1 次 LLM**；状态条提示统一为「🔄 AI 刷新状态档案中（批量 JSON Delta · N 个目标文件）…」，完成后给出摘要与改动统计。
+- `apply_updates` 返回的 `Vec<StateFileChange>` 会逐条写入 `state_sync_log`，便于在写作页底部最近日志直接看到每个文件的 action / 字数变化。
+- OpLog 在批量刷档全链路（开始 / 本地重建 / 跳过 story 控制层 / 完成 / 失败 / 跳过 LLM）补齐多条目，方便回溯。
+- 「保存并同步记忆」按钮 hover 文案更新为「1 次写作 LLM 调用（批量 JSON Delta）」，准确反映新链路。
+- `egui` 借用安全：节拍编辑、激活上下文小组件、伏笔追踪悬浮窗在迭代/可变借用前统一先 `clone` 关键数据快照，避免 `&mut self` 与子借用冲突。
+
+### 兼容性 / 迁移说明
+
+- 旧 `project.json` 加载无需改动，缺失的 `beats` 字段会默认为空 `Vec`；首次保存章节时自动按当前编辑器状态写回。
+- `state_refresh::build_state_document_prompts` 与 `sanitize_model_markdown` 暂时保留作为兼容回路，未被默认链路调用。
+- 批量 JSON Delta 当前仅写 `story_state/`；`story/author_intent.md` 与 `story/current_focus.md` 暂时跳过（OpLog 会显式记录），下一阶段评估是否纳入。
+
 ## [0.2.4] - 2026-05-13
 
 ### 新增

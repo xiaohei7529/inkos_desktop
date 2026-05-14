@@ -96,10 +96,14 @@ fn build_state_context_text(state_documents: &HashMap<String, String>) -> String
 }
 
 /// 构造生成章节的 (system, user) prompt。严格对齐 inkoswin.
+///
+/// `beats`：本章节拍（Beats First Workflow）。若非空，会作为最高优先级的 `[本章节拍]` 段
+/// 注入到 user_prompt 中，并在「请满足以下要求」处追加"必须逐条命中节拍"的硬约束。
 pub fn build_generation_prompts(
     project: &NovelProject,
     target_chapter: &ChapterRecord,
     previous_materials: &[(ChapterRecord, String)],
+    beats: &[String],
     current_draft: &str,
     state_documents: &HashMap<String, String>,
 ) -> (String, String) {
@@ -196,6 +200,31 @@ pub fn build_generation_prompts(
         project.title.trim().to_string()
     };
 
+    // 本章节拍（Beats First Workflow）：若非空，作为最高优先级注入；若为空则跳过该段，
+    // 同时也不在「请满足以下要求」里追加"必须逐条命中节拍"的硬约束（兼容旧流程）。
+    let cleaned_beats: Vec<String> = beats
+        .iter()
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty())
+        .collect();
+    let beats_section = if cleaned_beats.is_empty() {
+        String::new()
+    } else {
+        let mut s = String::from(
+            "[本章节拍]（最高优先级，必须逐条命中，不得跳过也不得新增大方向）\n",
+        );
+        for (i, b) in cleaned_beats.iter().enumerate() {
+            s.push_str(&format!("{}. {}\n", i + 1, b));
+        }
+        s.push('\n');
+        s
+    };
+    let beats_rule = if cleaned_beats.is_empty() {
+        ""
+    } else {
+        "         2.1 必须依次推进上方[本章节拍]的每一条节拍，禁止跳过或新增大方向。\n"
+    };
+
     let user_prompt = format!(
         "请为小说《{title_label}》创作第{n}章。\n\n\
          [创作目标]\n\
@@ -203,6 +232,7 @@ pub fn build_generation_prompts(
          - 建议标题：{chapter_title_hint}\n\
          - 目标字数：{word_goal} 字（必须控制在目标上下浮动，不得明显偏离）\n\
          - 体裁：{genre}\n\n\
+         {beats_section}\
          [小说设定]\n\
          - 故事核心：{premise}\n\
          - 主角与关键角色：{protagonists}\n\
@@ -217,6 +247,7 @@ pub fn build_generation_prompts(
          请满足以下要求：\n\
          1. 情节必须承接前文，不能与既有设定冲突。\n\
          2. 章节要有明显推进，不能只写重复铺垫。\n\
+         {beats_rule}\
          3. 如果建议标题不合适，可以优化，但仍要符合当前情节。\n\
          3.1 正文字数必须尽量贴近目标字数，偏差控制在约 ±15% 内，禁止空洞重复凑字数。\n\
          4. 输出格式必须严格如下：\n\n\
@@ -236,6 +267,171 @@ pub fn build_generation_prompts(
     );
 
     (system_prompt, user_prompt)
+}
+
+/// 构造「生成本章节拍」的 (system, user) prompt。
+///
+/// - 仅依赖最近若干章摘要 + 小说核心设定 + 大纲，不读全量状态档案；
+/// - 要求输出 3-5 行短句，每行一条节拍，便于后续 `parse_beats_output` 解析。
+pub fn build_beats_prompts(
+    project: &NovelProject,
+    target_chapter: &ChapterRecord,
+    previous_materials: &[(ChapterRecord, String)],
+) -> (String, String) {
+    let system_prompt = "你是一名长篇小说章节节拍规划助手。\
+你需要在正式写正文之前，先给出本章的 3-5 条节拍（Beats），每条节拍是一句话短句，描述本章的关键推进点。\
+不要标号，不要解释，不要输出任何额外内容，只输出 3-5 行短句，每行一条节拍。"
+        .to_string();
+
+    // 复用与 build_generation_prompts 一致的「最近 12 章摘要 / 最近 3 章节选」节流，
+    // 但节拍生成不需要节选，只取摘要即可。
+    let summary_tail: Vec<&(ChapterRecord, String)> = previous_materials
+        .iter()
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let mut summary_lines: Vec<String> = Vec::new();
+    for (chapter, content) in &summary_tail {
+        let summary = {
+            let s = chapter.summary.trim();
+            if s.is_empty() {
+                make_summary(content, 100)
+            } else {
+                s.to_string()
+            }
+        };
+        let title = if chapter.title.trim().is_empty() {
+            format!("第{}章", chapter.number)
+        } else {
+            chapter.title.trim().to_string()
+        };
+        summary_lines.push(format!(
+            "第{}章《{}》：{}",
+            chapter.number, title, summary
+        ));
+    }
+    let history_summary = if summary_lines.is_empty() {
+        "暂无已完成章节。".to_string()
+    } else {
+        summary_lines.join("\n")
+    };
+
+    let title_label = if project.title.trim().is_empty() {
+        "未命名小说".to_string()
+    } else {
+        project.title.trim().to_string()
+    };
+    let chapter_title_hint = if target_chapter.title.trim().is_empty() {
+        format!("第{}章", target_chapter.number)
+    } else {
+        target_chapter.title.trim().to_string()
+    };
+
+    let user_prompt = format!(
+        "请为小说《{title_label}》规划第{n}章的本章节拍。\n\n\
+         [本章定位]\n\
+         - 目标章节：第{n}章\n\
+         - 建议标题：{chapter_title_hint}\n\
+         - 目标字数：{word_goal} 字\n\
+         - 体裁：{genre}\n\n\
+         [小说核心]\n\
+         - 故事核心：{premise}\n\
+         - 主角与关键角色：{protagonists}\n\
+         - 世界观与背景：{world_setting}\n\
+         - 文风与节奏：{writing_style}\n\n\
+         [总纲与后续方向]\n{outline}\n\n\
+         [额外要求]\n{extra}\n\n\
+         [前文摘要]\n{history_summary}\n\n\
+         请输出 3-5 条本章节拍，每条短句 16~40 字，每行一条，遵守：\n\
+         1. 节拍必须可执行：聚焦地点/人物/动作/冲突/揭示，不要写主旨口号。\n\
+         2. 必须承接前文，不能与既有设定冲突。\n\
+         3. 全部节拍合起来要让本章有明显推进。\n\
+         4. 不要标号（不要 1.、- 等前缀），不要解释，只输出节拍正文，每行一条。\n",
+        n = target_chapter.number,
+        word_goal = project.chapter_word_goal,
+        genre = blank_or(&project.genre, "未指定"),
+        premise = blank_or(&project.premise, "未填写"),
+        protagonists = blank_or(&project.protagonists, "未填写"),
+        world_setting = blank_or(&project.world_setting, "未填写"),
+        writing_style = blank_or(&project.writing_style, "未填写"),
+        outline = blank_or(&project.outline, "未填写"),
+        extra = blank_or(&project.extra_guidance, "无"),
+    );
+
+    (system_prompt, user_prompt)
+}
+
+/// 解析 LLM 输出的节拍：按行切分、去空、去 markdown 编号前缀、最多保留 5 条。
+pub fn parse_beats_output(raw: &str) -> Vec<String> {
+    let cleaned = raw.trim().trim_matches('`').trim();
+    let mut beats: Vec<String> = Vec::new();
+    for raw_line in cleaned.lines() {
+        let mut line = raw_line.trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+        // 去掉常见前缀：`- `、`* `、`• `、`1. `、`1) `、`1、`、`第1拍：` 等
+        line = strip_beat_prefix(&line);
+        let line = line.trim().trim_start_matches('"').trim_end_matches('"').trim();
+        if line.is_empty() {
+            continue;
+        }
+        beats.push(line.to_string());
+        if beats.len() >= 5 {
+            break;
+        }
+    }
+    beats
+}
+
+fn strip_beat_prefix(line: &str) -> String {
+    let mut s = line.to_string();
+    // markdown 项目符号 / bullet
+    for prefix in ["- ", "* ", "• ", "·", "—", "– "] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.trim_start().to_string();
+        }
+    }
+    // 数字编号：1. 2. 1) 2) 1、2、第1拍：
+    let bytes = s.as_bytes();
+    let mut idx = 0;
+    // 可选「第」字
+    if s.starts_with('第') {
+        idx += '第'.len_utf8();
+    }
+    let start_digit = idx;
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    if idx > start_digit && idx < bytes.len() {
+        // 跳过可选「拍/条/章」中文字符
+        let rest = &s[idx..];
+        let mut consumed = 0;
+        for ch in rest.chars() {
+            if matches!(ch, '拍' | '条' | '章') {
+                consumed += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let rest = &rest[consumed..];
+        if let Some(stripped) = rest
+            .strip_prefix("：")
+            .or_else(|| rest.strip_prefix(": "))
+            .or_else(|| rest.strip_prefix(":"))
+            .or_else(|| rest.strip_prefix("、"))
+            .or_else(|| rest.strip_prefix(". "))
+            .or_else(|| rest.strip_prefix("."))
+            .or_else(|| rest.strip_prefix(") "))
+            .or_else(|| rest.strip_prefix(")"))
+        {
+            return stripped.trim_start().to_string();
+        }
+    }
+    s
 }
 
 fn blank_or(s: &str, fallback: &str) -> String {
@@ -357,5 +553,36 @@ mod tests {
         assert_eq!(r.title, "夜雨");
         assert!(r.summary.len() > 0);
         assert!(r.content.starts_with("她推开门"));
+    }
+
+    #[test]
+    fn beats_parse_strips_common_prefixes() {
+        let raw = "1. 主角到达雪山脚下\n- 与师妹相遇并争执\n* 突遇黑衣杀手围攻\n第4拍：师妹被劫走\n5) 主角立誓追凶";
+        let beats = parse_beats_output(raw);
+        assert_eq!(beats.len(), 5);
+        assert_eq!(beats[0], "主角到达雪山脚下");
+        assert_eq!(beats[1], "与师妹相遇并争执");
+        assert_eq!(beats[2], "突遇黑衣杀手围攻");
+        assert_eq!(beats[3], "师妹被劫走");
+        assert_eq!(beats[4], "主角立誓追凶");
+    }
+
+    #[test]
+    fn beats_parse_caps_at_five() {
+        let raw = (1..=10)
+            .map(|i| format!("{i}. beat-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let beats = parse_beats_output(&raw);
+        assert_eq!(beats.len(), 5);
+        assert_eq!(beats[0], "beat-1");
+        assert_eq!(beats[4], "beat-5");
+    }
+
+    #[test]
+    fn beats_parse_ignores_blank_lines_and_fences() {
+        let raw = "```\n\n  - a\n\n  b\n\n```";
+        let beats = parse_beats_output(raw);
+        assert_eq!(beats, vec!["a".to_string(), "b".to_string()]);
     }
 }
