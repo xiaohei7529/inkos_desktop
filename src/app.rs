@@ -817,6 +817,7 @@ impl InkOsApp {
         let novel_root = self.novel_path.clone();
 
         if let Some(reason) = self.state_refresh_prereq_reason() {
+            self.status_message = format!("已保存第 {n} 章；长期记忆未同步：{reason}");
             oplog::try_append(
                 novel_root.as_deref(),
                 "AI 刷新长期记忆 · 自动跳过",
@@ -826,6 +827,7 @@ impl InkOsApp {
         }
         let vendor_id = self.settings.writing_vendor.clone();
         if vendor_id.is_empty() {
+            self.status_message = format!("已保存第 {n} 章；长期记忆未同步：未选择写作 LLM");
             oplog::try_append(
                 novel_root.as_deref(),
                 "AI 刷新长期记忆 · 自动跳过",
@@ -838,6 +840,7 @@ impl InkOsApp {
             .map(|c| c.is_configured())
             .unwrap_or(false);
         if !cfg_ok {
+            self.status_message = format!("已保存第 {n} 章；长期记忆未同步：写作 LLM 服务商未完整配置");
             oplog::try_append(
                 novel_root.as_deref(),
                 "AI 刷新长期记忆 · 自动跳过",
@@ -916,7 +919,7 @@ impl InkOsApp {
                 oplog::try_append(self.novel_path.as_deref(), "新建章节", &format!("第 {n} 章"));
                 self.select_chapter(n);
                 self.chapter_dirty = true;
-                self.status_message = format!("已新建第 {n} 章");
+                self.status_message = format!("已新建第 {n} 章（状态档案模板已就绪；保存正文后再同步长期记忆）");
             }
             Err(e) => self.status_message = format!("新建章节失败：{e}"),
         }
@@ -2843,6 +2846,7 @@ impl InkOsApp {
                 ui.horizontal(|ui| {
                     let can_create = !self.wizard_dir.is_empty()
                         && !self.wizard_project.title.trim().is_empty()
+                        && !self.wizard_project.genre.trim().is_empty()
                         && !self.wizard_project.premise.trim().is_empty();
                     ui.add_enabled_ui(can_create, |ui| {
                         if ui.button(RichText::new("🚀  创建小说档案").strong()).clicked() {
@@ -2869,6 +2873,10 @@ impl InkOsApp {
 
         if want_create {
             let dir = std::path::PathBuf::from(&self.wizard_dir);
+            if let Err(e) = crate::project::validate_new_project_dir(&dir) {
+                self.status_message = format!("创建失败：{e}");
+                return;
+            }
             let store = crate::project::ProjectStore::new(dir.clone());
             let mut project = self.wizard_project.clone();
             match store.save_project(&mut project) {
@@ -2879,7 +2887,7 @@ impl InkOsApp {
                     } else {
                         self.section = Section::NovelMeta;
                         self.status_message = format!(
-                            "已创建小说《{}》，状态档案已初始化。",
+                            "已创建小说《{}》，并初始化本地状态档案模板。",
                             self.wizard_project.title.trim()
                         );
                     }
@@ -4898,10 +4906,10 @@ impl InkOsApp {
             self.status_message = "已有生成任务在进行中".into();
             return;
         }
-        // 检查小说档案是否已完善（标题和故事核心是必填项）
+        // 检查小说档案是否已完善（标题、题材和故事核心是必填项）
         if let Some(ref p) = self.project {
-            if p.title.trim().is_empty() || p.premise.trim().is_empty() {
-                self.status_message = "请先前往「小说设定」完善小说档案（标题和故事核心为必填项）再生成。".into();
+            if p.title.trim().is_empty() || p.genre.trim().is_empty() || p.premise.trim().is_empty() {
+                self.status_message = "请先前往「小说设定」完善小说档案（标题、题材和故事核心为必填项）再生成。".into();
                 self.section = Section::NovelMeta;
                 return;
             }
@@ -7008,17 +7016,40 @@ impl InkOsApp {
     /// 左侧服务商列表（替代旧 `ui_vendor_grid`）
     fn ui_vendor_list(&mut self, ui: &mut egui::Ui) {
         let mut to_select: Option<String> = None;
+        let configured_count = VENDORS
+            .iter()
+            .filter(|v| {
+                self.settings
+                    .vendors
+                    .get(v.id)
+                    .map(|c| c.is_configured())
+                    .unwrap_or(false)
+            })
+            .count();
 
         egui::ScrollArea::vertical()
             .id_salt("vendor_list_scroll")
             .auto_shrink([false; 2])
             .show(ui, |ui| {
+                egui::Frame::default()
+                    .fill(color::PANEL)
+                    .inner_margin(Margin::symmetric(12, 10))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("服务商").size(12.0).color(color::TEXT_DIM));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                theme::pill(
+                                    ui,
+                                    &format!("{configured_count}/{} 已配置", VENDORS.len()),
+                                    color::TEXT,
+                                    color::SURFACE_HI,
+                                );
+                            });
+                        });
+                        ui.add_space(2.0);
+                        dim_label(ui, "选择一个服务商后在右侧维护连接、模型和生成参数。");
+                    });
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(12.0);
-                    ui.label(RichText::new("服务商").size(11.0).color(color::TEXT_FAINT));
-                });
-                ui.add_space(4.0);
 
                 for v in VENDORS {
                     let configured = self
@@ -7028,49 +7059,71 @@ impl InkOsApp {
                         .map(|c| c.is_configured())
                         .unwrap_or(false);
                     let selected = self.selected_vendor_id.as_deref() == Some(v.id);
+                    let mut uses = Vec::new();
+                    if self.settings.active_vendor == v.id {
+                        uses.push("活跃");
+                    }
+                    if self.settings.writing_vendor == v.id {
+                        uses.push("写作");
+                    }
+                    if self.settings.review_vendor == v.id {
+                        uses.push("审计");
+                    }
+                    let usage = if uses.is_empty() { "未分配".to_string() } else { uses.join(" / ") };
 
                     let resp = egui::Frame::default()
-                        .fill(if selected {
-                            color::ACCENT.linear_multiply(0.18)
-                        } else {
-                            Color32::TRANSPARENT
-                        })
-                        .corner_radius(CornerRadius::same(6))
-                        .inner_margin(Margin::symmetric(12, 7))
+                        .fill(if selected { color::ACCENT_DIM.linear_multiply(0.55) } else { color::SURFACE })
+                        .stroke(Stroke::new(
+                            if selected { 1.2 } else { 1.0 },
+                            if selected { color::ACCENT } else { color::BORDER },
+                        ))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(Margin::symmetric(10, 8))
                         .show(ui, |ui| {
-                            ui.set_min_width(ui.available_width());
                             ui.horizontal(|ui| {
-                                // 配置状态指示点
-                                let dot_color = if configured {
-                                    color::SUCCESS
-                                } else {
-                                    color::TEXT_FAINT
-                                };
-                                let (dot_rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(8.0, 8.0),
+                                let (bar_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(3.0, 44.0),
                                     egui::Sense::hover(),
                                 );
-                                ui.painter().circle_filled(dot_rect.center(), 3.5, dot_color);
+                                ui.painter().rect_filled(
+                                    bar_rect,
+                                    CornerRadius::same(3),
+                                    if selected {
+                                        color::ACCENT
+                                    } else if configured {
+                                        color::SUCCESS
+                                    } else {
+                                        color::BORDER_HI
+                                    },
+                                );
 
                                 ui.add_space(4.0);
                                 ui.vertical(|ui| {
-                                    ui.label(
-                                        RichText::new(v.name)
-                                            .size(13.0)
-                                            .color(if selected {
-                                                color::ACCENT_HI
-                                            } else {
-                                                color::TEXT
-                                            })
-                                            .strong(),
-                                    );
-                                    if !v.note.is_empty() {
+                                    ui.horizontal(|ui| {
                                         ui.label(
-                                            RichText::new(v.note)
-                                                .size(10.5)
-                                                .color(color::TEXT_FAINT),
+                                            RichText::new(v.name)
+                                                .size(13.0)
+                                                .color(if selected { color::ACCENT_HI } else { color::TEXT })
+                                                .strong(),
                                         );
-                                    }
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                let (label, fg, bg) = if configured {
+                                                    ("已配置", color::SUCCESS, color::SUCCESS.linear_multiply(0.15))
+                                                } else {
+                                                    ("待配置", color::TEXT_DIM, color::SURFACE_HI)
+                                                };
+                                                theme::pill(ui, label, fg, bg);
+                                            },
+                                        );
+                                    });
+                                    ui.add_space(2.0);
+                                    ui.label(
+                                        RichText::new(format!("{} · {}", usage, v.note))
+                                            .size(10.5)
+                                            .color(color::TEXT_FAINT),
+                                    );
                                 });
                             });
                         })
@@ -7083,6 +7136,7 @@ impl InkOsApp {
                     if resp.clicked() {
                         to_select = Some(v.id.to_string());
                     }
+                    ui.add_space(6.0);
                 }
                 ui.add_space(8.0);
             });
@@ -7105,11 +7159,11 @@ impl InkOsApp {
     fn ui_vendor_config_panel(&mut self, ui: &mut egui::Ui) {
         let Some(id) = self.selected_vendor_id.clone() else {
             ui.centered_and_justified(|ui| {
-                ui.label(
-                    RichText::new("← 从左侧选择服务商进行配置")
-                        .color(color::TEXT_FAINT)
-                        .size(13.0),
-                );
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("选择服务商").size(15.0).color(color::TEXT));
+                    ui.add_space(4.0);
+                    dim_label(ui, "从左侧列表选择一个服务商后，可在这里维护连接与模型配置。");
+                });
             });
             return;
         };
@@ -7124,181 +7178,192 @@ impl InkOsApp {
         let mut want_test = false;
         let mut want_fetch_models = false;
 
-        // 标题行
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(&title).size(16.0).strong());
-            if self
-                .settings
-                .vendors
-                .get(&id)
-                .map(|c| c.is_configured())
-                .unwrap_or(false)
-            {
-                ui.add_space(6.0);
-                theme::pill(ui, "已配置", color::SUCCESS, color::SUCCESS.linear_multiply(0.15));
-            }
-        });
-        if let Some(p) = preset {
-            if !p.note.is_empty() {
-                dim_label(ui, p.note);
-            }
-        }
-        ui.add_space(10.0);
-        ui.separator();
-        ui.add_space(10.0);
-
-        // 基础配置区
-        ui.label(RichText::new("基础配置").size(11.5).color(color::TEXT_FAINT));
-        ui.add_space(6.0);
-
-        ui.label(RichText::new("Base URL").size(11.5).color(color::TEXT_DIM));
-        ui.add(
-            TextEdit::singleline(&mut self.edit_vendor_buf.base_url)
-                .desired_width(f32::INFINITY)
-                .hint_text("https://api.example.com/v1")
-                .id_salt("vp_base"),
-        );
-        ui.add_space(8.0);
-
-        ui.label(RichText::new("API Key").size(11.5).color(color::TEXT_DIM));
-        ui.add(
-            TextEdit::singleline(&mut self.edit_vendor_buf.api_key)
-                .password(true)
-                .desired_width(f32::INFINITY)
-                .hint_text("sk-…")
-                .id_salt("vp_key"),
-        );
-        ui.add_space(8.0);
-
-        ui.label(RichText::new("默认模型").size(11.5).color(color::TEXT_DIM));
         let models_busy = self
             .vendor_models_task
             .as_ref()
             .is_some_and(|t| !t.done);
-        ui.horizontal(|ui| {
-            let btn_w = 108.0;
-            ui.add(
-                TextEdit::singleline(&mut self.edit_vendor_buf.model)
-                    .desired_width((ui.available_width() - btn_w - 6.0).max(80.0))
-                    .hint_text("模型 ID，例如 gpt-4o-mini")
-                    .id_salt("vp_model"),
-            );
-            if ui
-                .add_enabled(
-                    !models_busy,
-                    egui::Button::new(if models_busy {
-                        "⏳ 获取中…"
+
+        egui::Frame::default()
+            .fill(color::PANEL)
+            .stroke(Stroke::new(1.0, color::BORDER))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&title).size(16.0).strong());
+                    let configured = self
+                        .settings
+                        .vendors
+                        .get(&id)
+                        .map(|c| c.is_configured())
+                        .unwrap_or(false);
+                    ui.add_space(6.0);
+                    if configured {
+                        theme::pill(ui, "已配置", color::SUCCESS, color::SUCCESS.linear_multiply(0.15));
                     } else {
-                        "📋  获取模型"
-                    }),
-                )
-                .on_hover_text(
-                    "GET {Base URL}/models（OpenAI 兼容）。\n\
-                     若已填写 API Key，将设置请求头：Authorization: Bearer <API Key>。",
-                )
-                .clicked()
-            {
-                want_fetch_models = true;
-            }
-        });
-        if !self.vendor_models_msg.is_empty() {
-            let c = if self.vendor_models_msg.starts_with('✓') {
-                color::SUCCESS
-            } else if self.vendor_models_msg.starts_with('✗') || self.vendor_models_msg.contains("失败") {
-                color::DANGER
-            } else {
-                color::TEXT_DIM
-            };
-            ui.label(RichText::new(&self.vendor_models_msg).color(c).size(11.5));
-        }
-        if models_busy {
-            dim_label(ui, "正在请求远端模型列表…");
-        }
-        if !self.vendor_models_list.is_empty() {
-            ui.add_space(4.0);
-            ui.label(RichText::new("筛选").size(11.5).color(color::TEXT_DIM));
-            ui.add(
-                TextEdit::singleline(&mut self.vendor_models_filter)
-                    .hint_text("输入关键字过滤模型 id")
-                    .desired_width(f32::INFINITY)
-                    .id_salt("vp_models_filter"),
-            );
-            let needle = self.vendor_models_filter.trim().to_lowercase();
-            let filtered: Vec<String> = self
-                .vendor_models_list
-                .iter()
-                .filter(|m| needle.is_empty() || m.to_lowercase().contains(&needle))
-                .cloned()
-                .collect();
-            let mut picked: Option<String> = None;
-            egui::ScrollArea::vertical()
-                .id_salt("vp_models_scroll")
-                .max_height(200.0)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    for m in &filtered {
-                        let selected = self.edit_vendor_buf.model == *m;
-                        if ui.selectable_label(selected, m.as_str()).clicked() {
-                            picked = Some(m.clone());
-                        }
+                        theme::pill(ui, "待配置", color::TEXT_DIM, color::SURFACE_HI);
                     }
                 });
-            if let Some(m) = picked {
-                self.edit_vendor_buf.model = m;
-            }
-        }
+                if let Some(p) = preset {
+                    if !p.note.is_empty() {
+                        dim_label(ui, p.note);
+                    }
+                }
+            });
 
-        ui.add_space(14.0);
-        ui.separator();
-        ui.add_space(8.0);
+        ui.add_space(10.0);
 
-        // 生成参数区
-        ui.label(RichText::new("生成参数").size(11.5).color(color::TEXT_FAINT));
-        ui.add_space(6.0);
-        ui.columns(3, |cols| {
-            cols[0].label(
-                RichText::new("Temperature").size(11.5).color(color::TEXT_DIM),
-            );
-            cols[0].add(
-                TextEdit::singleline(&mut self.edit_vendor_buf.temperature)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("0.7")
-                    .id_salt("vp_t"),
-            );
-            cols[1].label(
-                RichText::new("Max Tokens").size(11.5).color(color::TEXT_DIM),
-            );
-            cols[1].add(
-                TextEdit::singleline(&mut self.edit_vendor_buf.max_tokens)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("4096")
-                    .id_salt("vp_x"),
-            );
-            cols[2].label(
-                RichText::new("Thinking Budget").size(11.5).color(color::TEXT_DIM),
-            );
-            cols[2].add(
-                TextEdit::singleline(&mut self.edit_vendor_buf.thinking_budget)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("（可选）")
-                    .id_salt("vp_h"),
-            );
-        });
+        egui::Frame::default()
+            .fill(color::SURFACE)
+            .stroke(Stroke::new(1.0, color::BORDER))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.label(RichText::new("连接信息").size(12.0).color(color::TEXT_DIM).strong());
+                ui.add_space(6.0);
+                ui.label(RichText::new("Base URL").size(11.5).color(color::TEXT_DIM));
+                ui.add(
+                    TextEdit::singleline(&mut self.edit_vendor_buf.base_url)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("https://api.example.com/v1")
+                        .id_salt("vp_base"),
+                );
+                ui.add_space(8.0);
+                ui.label(RichText::new("API Key").size(11.5).color(color::TEXT_DIM));
+                ui.add(
+                    TextEdit::singleline(&mut self.edit_vendor_buf.api_key)
+                        .password(true)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("sk-…")
+                        .id_salt("vp_key"),
+                );
+            });
 
-        ui.add_space(14.0);
-        ui.separator();
-        ui.add_space(8.0);
+        ui.add_space(10.0);
 
-        // 连接测试区
+        egui::Frame::default()
+            .fill(color::SURFACE)
+            .stroke(Stroke::new(1.0, color::BORDER))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.label(RichText::new("模型与参数").size(12.0).color(color::TEXT_DIM).strong());
+                ui.add_space(6.0);
+                ui.label(RichText::new("默认模型").size(11.5).color(color::TEXT_DIM));
+                ui.horizontal(|ui| {
+                    let btn_w = 108.0;
+                    ui.add(
+                        TextEdit::singleline(&mut self.edit_vendor_buf.model)
+                            .desired_width((ui.available_width() - btn_w - 6.0).max(80.0))
+                            .hint_text("模型 ID，例如 gpt-4o-mini")
+                            .id_salt("vp_model"),
+                    );
+                    if ui
+                        .add_enabled(
+                            !models_busy,
+                            egui::Button::new(if models_busy { "⏳ 获取中…" } else { "📋  获取模型" }),
+                        )
+                        .on_hover_text(
+                            "GET {Base URL}/models（OpenAI 兼容）。\n\
+                             若已填写 API Key，将设置请求头：Authorization: Bearer <API Key>。",
+                        )
+                        .clicked()
+                    {
+                        want_fetch_models = true;
+                    }
+                });
+                if !self.vendor_models_msg.is_empty() {
+                    let c = if self.vendor_models_msg.starts_with('✓') {
+                        color::SUCCESS
+                    } else if self.vendor_models_msg.starts_with('✗') || self.vendor_models_msg.contains("失败") {
+                        color::DANGER
+                    } else {
+                        color::TEXT_DIM
+                    };
+                    ui.label(RichText::new(&self.vendor_models_msg).color(c).size(11.5));
+                }
+                if models_busy {
+                    dim_label(ui, "正在请求远端模型列表…");
+                }
+                if !self.vendor_models_list.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("筛选").size(11.5).color(color::TEXT_DIM));
+                    ui.add(
+                        TextEdit::singleline(&mut self.vendor_models_filter)
+                            .hint_text("输入关键字过滤模型 id")
+                            .desired_width(f32::INFINITY)
+                            .id_salt("vp_models_filter"),
+                    );
+                    let needle = self.vendor_models_filter.trim().to_lowercase();
+                    let filtered: Vec<String> = self
+                        .vendor_models_list
+                        .iter()
+                        .filter(|m| needle.is_empty() || m.to_lowercase().contains(&needle))
+                        .cloned()
+                        .collect();
+                    let mut picked: Option<String> = None;
+                    egui::ScrollArea::vertical()
+                        .id_salt("vp_models_scroll")
+                        .max_height(160.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for m in &filtered {
+                                let selected = self.edit_vendor_buf.model == *m;
+                                if ui.selectable_label(selected, m.as_str()).clicked() {
+                                    picked = Some(m.clone());
+                                }
+                            }
+                        });
+                    if let Some(m) = picked {
+                        self.edit_vendor_buf.model = m;
+                    }
+                }
+                ui.add_space(10.0);
+                ui.columns(3, |cols| {
+                    cols[0].label(RichText::new("Temperature").size(11.5).color(color::TEXT_DIM));
+                    cols[0].add(
+                        TextEdit::singleline(&mut self.edit_vendor_buf.temperature)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("0.7")
+                            .id_salt("vp_t"),
+                    );
+                    cols[1].label(RichText::new("Max Tokens").size(11.5).color(color::TEXT_DIM));
+                    cols[1].add(
+                        TextEdit::singleline(&mut self.edit_vendor_buf.max_tokens)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("4096")
+                            .id_salt("vp_x"),
+                    );
+                    cols[2].label(RichText::new("Thinking Budget").size(11.5).color(color::TEXT_DIM));
+                    cols[2].add(
+                        TextEdit::singleline(&mut self.edit_vendor_buf.thinking_budget)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("（可选）")
+                            .id_salt("vp_h"),
+                    );
+                });
+            });
+
+        ui.add_space(10.0);
+
         egui::Frame::default()
             .fill(color::SURFACE_HI)
             .stroke(Stroke::new(1.0, color::BORDER))
             .corner_radius(CornerRadius::same(8))
-            .inner_margin(Margin::symmetric(12, 8))
+            .inner_margin(Margin::symmetric(12, 10))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("连接测试").color(color::TEXT_DIM).size(11.5));
+                    ui.label(RichText::new("验证与保存").color(color::TEXT_DIM).size(12.0).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(egui::Button::new(RichText::new("移除配置").color(color::DANGER)).fill(color::SURFACE))
+                            .clicked()
+                        {
+                            want_delete = true;
+                        }
+                        if ui.add(egui::Button::new(RichText::new("💾  保存配置").strong())).clicked() {
+                            want_save = true;
+                        }
                         if self.vendor_test_task.is_some() {
                             ui.add_enabled(false, egui::Button::new("⏳  测试中…"));
                         } else if ui.button("🔌  测试连接").clicked() {
@@ -7318,34 +7383,9 @@ impl InkOsApp {
                             .size(12.0),
                     );
                 } else if self.vendor_test_task.is_none() {
-                    dim_label(ui, "点击「测试连接」向所选模型发起一次最小请求。");
+                    dim_label(ui, "测试连接会向所选模型发起一次最小请求；保存后可在写作/审计配置中分配用途。");
                 }
             });
-
-        ui.add_space(14.0);
-
-        // 操作按钮行
-        ui.horizontal(|ui| {
-            if ui
-                .add(egui::Button::new(RichText::new("💾  保存配置").strong()))
-                .clicked()
-            {
-                want_save = true;
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new("移除配置").color(color::DANGER),
-                        )
-                        .fill(color::SURFACE_HI),
-                    )
-                    .clicked()
-                {
-                    want_delete = true;
-                }
-            });
-        });
 
         // 处理测试
         if want_test {

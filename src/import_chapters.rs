@@ -6,11 +6,9 @@
 //! - 已存在的章节文件默认跳过（断点续导）；可通过 `overwrite=true` 强制覆盖。
 //! - 拆分顺序按文本中出现的先后；若无法匹配任意标题，则整个文件作为「第 1 章」。
 
-use std::fs;
-use std::path::Path;
-
 use anyhow::{Context, Result};
 use regex::Regex;
+use std::fs;
 
 use crate::chapter_md::compose_chapter_markdown;
 use crate::project::{NovelProject, ProjectStore};
@@ -71,7 +69,7 @@ pub struct ImportReport {
 }
 
 pub fn default_split_regex() -> &'static str {
-    r"(?m)^\s*第\s*[一二三四五六七八九十百千零〇0-9]+\s*章[^\n]*$"
+    r"(?m)^\s*第\s*[一二三四五六七八九十百千零〇0-9]+\s*章(?:\s+|[：:、\-—]|$)[^\n]*$"
 }
 
 /// 仅做拆分，不写盘。返回 (标题, 正文) 列表。
@@ -182,6 +180,16 @@ mod tests {
         assert_eq!(segs.len(), 2);
         assert!(segs[0].1.contains("第一章正文"));
         assert!(segs[1].0.contains("第二章"));
+        assert!(segs[1].1.contains("第二章正文"));
+    }
+
+    #[test]
+    fn split_title_with_punctuation() {
+        let raw = "第一章：序幕\n正文\n\n第二章-风暴\n正文";
+        let segs = split_text(raw, default_split_regex()).unwrap();
+        assert_eq!(segs.len(), 2);
+        assert!(segs[0].0.contains("序幕"));
+        assert!(segs[1].0.contains("风暴"));
     }
 
     #[test]

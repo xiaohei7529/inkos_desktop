@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::chapter_md::{
@@ -556,6 +556,24 @@ impl ProjectStore {
     }
 }
 
+pub fn validate_new_project_dir(path: &Path) -> Result<()> {
+    if path.join(".inkoswin").join("project.json").exists()
+        || path.join(".inkos").join("project.json").exists()
+    {
+        bail!("该目录已有小说档案，请使用「打开目录」载入。");
+    }
+
+    if path.exists() {
+        let mut entries = fs::read_dir(path)
+            .with_context(|| format!("read project dir {:?}", path))?;
+        if entries.next().is_some() {
+            bail!("请选择空目录（或新建文件夹）作为小说根目录。");
+        }
+    }
+
+    Ok(())
+}
+
 struct StateSpec {
     filename: &'static str,
     template: &'static str,
@@ -682,4 +700,53 @@ fn mtime_iso(path: &Path) -> Option<String> {
             .format("%Y-%m-%dT%H:%M:%S")
             .to_string(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_project_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "inkos_desktop_{name}_{}_{}",
+            std::process::id(),
+            stamp
+        ))
+    }
+
+    #[test]
+    fn validate_new_project_dir_allows_empty_dir() {
+        let dir = temp_project_dir("empty");
+        fs::create_dir_all(&dir).unwrap();
+        let result = validate_new_project_dir(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_new_project_dir_rejects_existing_project() {
+        let dir = temp_project_dir("existing");
+        fs::create_dir_all(dir.join(".inkoswin")).unwrap();
+        fs::write(dir.join(".inkoswin").join("project.json"), "{}").unwrap();
+        let result = validate_new_project_dir(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("已有小说档案"));
+    }
+
+    #[test]
+    fn validate_new_project_dir_rejects_non_empty_dir() {
+        let dir = temp_project_dir("non_empty");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("notes.txt"), "draft").unwrap();
+        let result = validate_new_project_dir(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("空目录"));
+    }
 }
