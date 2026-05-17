@@ -7,6 +7,7 @@
 //! 3. 任何不在白名单内的文件、空内容、或 patch 找不到旧片段时都会被记录在 [`StateFileChange::note`]，
 //!    主程序据此向用户与操作日志反馈。
 
+use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -28,6 +29,85 @@ pub struct StateSyncReport {
     pub summary: String,
     #[serde(default)]
     pub updates: Vec<StateUpdate>,
+}
+
+/// 审计 AI 返回的「可执行动作」列表对应的 JSON 根结构（参见 `ReviewAuditReport::actions`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewAction {
+    pub title: String,
+    /// `"text_rewrite"`（改写正文）或 `"state_sync"`（同步档案）等扩展类型。
+    pub action_type: String,
+    pub description: String,
+    /// 具体修改数据或与后续流程相关的 JSON 负载。
+    pub payload: serde_json::Value,
+}
+
+/// 审计 AI 返回的 JSON 根对象：一组待处理动作。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewAuditReport {
+    #[serde(default)]
+    pub actions: Vec<ReviewAction>,
+}
+
+const AUDIT_JSON_FENCE_MARKER: &str = "```json";
+
+/// 末尾 ```json … ```（审计约定的机器可读区块）已从 Markdown 审稿正文中剪掉；若无闭合围栏则原样返回。
+pub fn strip_audit_trailing_json_fence(raw: &str) -> Cow<'_, str> {
+    let marker = AUDIT_JSON_FENCE_MARKER;
+    let Some(open) = raw.rfind(marker) else {
+        return Cow::Borrowed(raw);
+    };
+    let after_open = &raw[open + marker.len()..];
+    let after_open = after_open.trim_start_matches(['\r', '\n']);
+    match after_open.find("```") {
+        Some(_) => {
+            let md = raw[..open].trim_end_matches([' ', '\t']);
+            Cow::Owned(md.trim_end_matches(['\r', '\n']).to_string())
+        }
+        None => Cow::Borrowed(raw),
+    }
+}
+
+/// 从全文尾部截取闭合的 ` ```json ` 围栏内 JSON 文本（供悬念审计等复用）。
+pub fn trailing_json_fence_body(trimmed_full: &str) -> Option<&str> {
+    audit_review_json_fence_body(trimmed_full)
+}
+
+fn audit_review_json_fence_body(trimmed_full: &str) -> Option<&str> {
+    let marker = AUDIT_JSON_FENCE_MARKER;
+    let open = trimmed_full.rfind(marker)?;
+    let after_open = &trimmed_full[open + marker.len()..];
+    let after_open = after_open.trim_start_matches(['\r', '\n']);
+    let close = after_open.find("```")?;
+    Some(after_open[..close].trim())
+}
+
+/// 从审计 LLM 全文中截取尾部 ` ```json ` 围栏内的 JSON，解析为 [`ReviewAuditReport`]。
+pub fn parse_review_audit_report(raw: &str) -> Result<ReviewAuditReport> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("LLM 返回为空"));
+    }
+    if let Some(body) = audit_review_json_fence_body(trimmed) {
+        if let Ok(r) = serde_json::from_str::<ReviewAuditReport>(body) {
+            return Ok(r);
+        }
+    }
+    if let Ok(r) = serde_json::from_str::<ReviewAuditReport>(trimmed) {
+        return Ok(r);
+    }
+    // 容错：首尾大括号截取
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if end >= start {
+            let slice = &trimmed[start..=end];
+            if let Ok(r) = serde_json::from_str::<ReviewAuditReport>(slice) {
+                return Ok(r);
+            }
+        }
+    }
+    Err(anyhow!(
+        "无法解析为 ReviewAuditReport（需在正文末尾输出闭合的 ```json 围栏）"
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -238,4 +318,168 @@ fn apply_patch_blocks(old: &str, patch: &str) -> Result<(String, usize, usize)> 
         }
     }
     Ok((text, applied, failed))
+}
+
+/// 第一章写作完成后，从 LLM 全文尾部 JSON 同步悬念至 `pending_hooks.md` 的结果。
+#[derive(Debug, Clone)]
+pub struct PrologueHooksApplyResult {
+    pub summary: String,
+    pub updates_applied: usize,
+}
+
+const PROLOGUE_HOOKS_WHITELIST: &[&str] = &["pending_hooks.md"];
+
+/// 解析正文末尾 ` ```json ` 围栏中的 [`StateSyncReport`]，仅应用 `pending_hooks.md` 的 patch/replace。
+pub fn apply_prologue_pending_hooks_from_raw(
+    raw: &str,
+    novel_root: &Path,
+    state_dir: &Path,
+) -> Result<Option<PrologueHooksApplyResult>> {
+    let trimmed = raw.trim();
+    let Some(json_body) = audit_review_json_fence_body(trimmed) else {
+        return Ok(None);
+    };
+    let mut report: StateSyncReport = parse_state_updates(json_body)?;
+    report.updates.retain(|u| {
+        let file = u.file.trim();
+        let action = u.action.trim().to_lowercase();
+        file == "pending_hooks.md" && (action == "patch" || action == "replace" || action.is_empty())
+    });
+    if report.updates.is_empty() {
+        return Ok(None);
+    }
+    let n = report.updates.len();
+    let summary = report.summary.clone();
+    let _changes = apply_updates(novel_root, state_dir, &report, PROLOGUE_HOOKS_WHITELIST);
+    Ok(Some(PrologueHooksApplyResult {
+        summary,
+        updates_applied: n,
+    }))
+}
+
+/// 将 [`AuditHooksReport`] 增量 patch 至 `pending_hooks.md`（第一章悬念提取子任务落盘）。
+pub fn apply_audit_hooks_report(
+    report: &crate::inkoswin_prompt::AuditHooksReport,
+    novel_root: &Path,
+    state_dir: &Path,
+) -> Result<Option<PrologueHooksApplyResult>> {
+    let markdown = crate::inkoswin_prompt::hooks_report_to_pending_hooks_markdown(report);
+    if markdown.trim().is_empty() {
+        return Ok(None);
+    }
+    let patch_content = format!(
+        "===REPLACE_BLOCK===\n## 核心伏笔\n\n===WITH===\n## 核心伏笔\n\n{markdown}\n===END==="
+    );
+    let sync_report = StateSyncReport {
+        summary: format!("悬念审计提取 {} 条钩子", report.hooks.len()),
+        updates: vec![StateUpdate {
+            file: "pending_hooks.md".to_string(),
+            action: "patch".to_string(),
+            content: patch_content,
+        }],
+    };
+    let n = sync_report.updates.len();
+    let summary = sync_report.summary.clone();
+    let _ = apply_updates(novel_root, state_dir, &sync_report, PROLOGUE_HOOKS_WHITELIST);
+    Ok(Some(PrologueHooksApplyResult {
+        summary,
+        updates_applied: n,
+    }))
+}
+
+#[cfg(test)]
+mod prologue_hooks_tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_state_dir() -> (PathBuf, PathBuf) {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let novel = std::env::temp_dir().join(format!(
+            "inkos_prologue_hooks_{}_{}",
+            std::process::id(),
+            stamp
+        ));
+        let state = novel.join("story_state");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(
+            state.join("pending_hooks.md"),
+            "# 未闭合伏笔\n\n## 核心伏笔\n",
+        )
+        .unwrap();
+        (novel, state)
+    }
+
+    #[test]
+    fn apply_prologue_pending_hooks_patches_file() {
+        let (novel, state) = temp_state_dir();
+        let raw = "标题：一\n摘要：s\n正文：\n正文。\n\n```json\n\
+{\"summary\":\"发现新悬念\",\"updates\":[{\"file\":\"pending_hooks.md\",\"action\":\"patch\",\
+\"content\":\"===REPLACE_BLOCK===\\n## 核心伏笔\\n\\n===WITH===\\n## 核心伏笔\\n\\n- [悬念1] 左眼金光\\n\\n===END===\"}]}\n```";
+        let res = apply_prologue_pending_hooks_from_raw(raw, &novel, &state)
+            .unwrap()
+            .expect("should apply");
+        assert_eq!(res.updates_applied, 1);
+        let text = fs::read_to_string(state.join("pending_hooks.md")).unwrap();
+        assert!(text.contains("左眼金光"));
+        let _ = fs::remove_dir_all(&novel);
+    }
+
+    #[test]
+    fn apply_audit_hooks_report_appends_entries() {
+        let (novel, state) = temp_state_dir();
+        let report = crate::inkoswin_prompt::AuditHooksReport {
+            hooks: vec![crate::inkoswin_prompt::AuditHookEntry {
+                source: "戒指微微发烫".into(),
+                hook_type: "关键道具".into(),
+                status: "active".into(),
+                urgency: 4,
+            }],
+        };
+        let res = apply_audit_hooks_report(&report, &novel, &state)
+            .unwrap()
+            .expect("applied");
+        assert_eq!(res.updates_applied, 1);
+        let text = fs::read_to_string(state.join("pending_hooks.md")).unwrap();
+        assert!(text.contains("戒指微微发烫"));
+        assert!(text.contains("[线索片段]"));
+        let _ = fs::remove_dir_all(&novel);
+    }
+
+    #[test]
+    fn apply_prologue_skips_without_fence() {
+        let (novel, state) = temp_state_dir();
+        let raw = "标题：一\n正文：\n只有正文";
+        assert!(
+            apply_prologue_pending_hooks_from_raw(raw, &novel, &state)
+                .unwrap()
+                .is_none()
+        );
+        let _ = fs::remove_dir_all(&novel);
+    }
+}
+
+#[cfg(test)]
+mod review_audit_tests {
+    use super::*;
+
+    #[test]
+    fn strip_audit_fence_removes_closed_block() {
+        let raw = "### 审稿\n打分 8。\n```json\n{\"actions\":[]}\n```";
+        match strip_audit_trailing_json_fence(raw) {
+            Cow::Owned(s) => assert_eq!(s.trim(), "### 审稿\n打分 8。"),
+            Cow::Borrowed(_) => panic!("expected owned strip"),
+        }
+    }
+
+    #[test]
+    fn parse_review_audit_report_from_fence() {
+        let raw = "优点：好\n\n```json\n{\"actions\":[{\"title\":\"\",\"action_type\":\"state_sync\",\"description\":\"\",\"payload\":{\"file\":\"current_state.md\",\"action\":\"patch\",\"content\":\"\"}}]}\n```\n";
+        let r = parse_review_audit_report(raw).unwrap();
+        assert_eq!(r.actions.len(), 1);
+        assert_eq!(r.actions[0].action_type, "state_sync");
+    }
 }

@@ -4,6 +4,42 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
+## [Unreleased]
+
+## [0.3.2] - 2026-05-17
+
+主题：**章间缝合 + 开篇悬念闭环**。用章节末尾快照消除续写「时空断层」；第一章反大纲化写作与自动悬念提取写入 `pending_hooks.md`，后续章节强制推进已有钩子。
+
+### 新增
+
+- **章节末尾快照（`end_snapshot`）**：`ChapterRecord` 持久化每章正文末尾最多 500 字；保存章节时自动更新，写作第 N 章前通过 `resolve_last_chapter_end` 解析第 N−1 章衔接点。
+- **章间零秒缝合**：手动「生成本章 / 生成下一章」、定时写作、写作管线 Draft 均注入 `[上一章末尾衔接点]` 与硬约束；`extra_guidance` 与模板支持 `{{LAST_CHAPTER_END}}` 变量替换。
+- **慢节奏与重氛围写作指导**（`COMMON_WRITING_GUIDE`）：全写作入口统一注入；定时写作 system prompt 与慢节奏指导对齐。
+- **开篇悬念与动态节奏**：
+  - 第一章：`CHAPTER_ONE_STRATEGY`（反大纲化 / 信息遮蔽 / 微观张力）+ `PROLOGUE_SENSE_GUIDE`；`get_chapter_dynamic_prompt` 按章节号切换写作指导。
+  - 第 2 章起：`CONTINUITY_HOOKS_GUIDE` + 放大 `pending_hooks.md` 摘录（必读背景，须推进 1–2 条钩子，严禁只挖坑不填坑）。
+  - 第一章完成后：优先解析正文尾部 `StateSyncReport` JSON；若无有效块则自动启动 **悬念提取子任务**（`build_audit_hooks_prompts` → `AuditHooksReport` → `apply_audit_hooks_report`），静默写入 `pending_hooks.md`（[悬念名称] / [线索片段] / [潜在指向]）。
+  - `parse_generation_output` 剥离尾部 ` ```json ` 围栏，避免 JSON 进入章节正文。
+
+## [0.3.1] - 2026-05-16
+
+主题：**审核程序化行动 + 向导 AI 灵感**。审计结果在文末以 **json 代码围栏**约定输出可执行清单，用户可在审核页一键同步档案或触发文笔改写落盘；新建小说向导支持用写作 LLM 按模板生成四段设定草案。
+
+### 新增
+
+- **审核页「程序化行动」卡片**：
+  - 审计 LLM 完成后从全文尾部解析 `ReviewAuditReport`（`state_sync::parse_review_audit_report`），展示各条 `ReviewAction`。
+  - **`state_sync`**：将 `payload` 反序列化为 `StateUpdate` 后调用 `state_sync::apply_updates`（`STATE_FILES` 白名单），并把结果写入「状态档案同步」日志。
+  - **`text_rewrite`**：读取 `payload.rewrite_prompt` 再发起独立 `spawn_chat`（`audit_text_rewrite_task`），右上角悬浮窗展示流式输出；成功后复用 `persist_chapter_after_ai_rewrite` 写入本章并链式触发与「AI 改写 → 替换原文」相同的状态档案同步。
+  - Markdown 预览使用 `strip_audit_trailing_json_fence` 裁掉末尾 JSON 围栏，避免重复展示机器块。
+- **`state_sync` 解析与测试**：新增 `strip_audit_trailing_json_fence`、`parse_review_audit_report`；`review_audit_tests` 覆盖围栏剥离与反序列化。
+- **新建小说向导「AI 灵感生成」**：向导内按钮调用写作 LLM（`spawn_generate_init_settings`），产出带角标标签的四段设定并由 `inkoswin_prompt` 解析注入 `wizard_project`。
+
+### 优化
+
+- 「AI 改写 → 替换原文」与审计文笔优化共享 `persist_chapter_after_ai_rewrite`，章节备份、落盘与链式 `start_state_sync` 行为一致。
+- **审计 system 提示**：强化「先 Markdown、后收尾唯一 json 代码围栏」、StateUpdate / rewrite_prompt 字段约定；要求 **JSON `actions` 与正文意见一一对应且不遗漏关键档案同步**。
+
 ## [0.3.0] - 2026-05-14
 
 主题：**Beats First 写作流 + 批量 JSON Delta 刷档 + 写作页 Dashboard**。本版本把写作前置规划、长期记忆刷新、写作页态势感知三件事整体打通，AI 写作时的「注意力分散」和档案刷新的「重而慢」两大痛点同时收敛。

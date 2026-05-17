@@ -8,16 +8,18 @@ use std::time::{Instant, SystemTime};
 use chrono::NaiveDate;
 use eframe::egui::{self, Color32, ComboBox, CornerRadius, Margin, RichText, Stroke, TextEdit};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
-
 use crate::audit_log::{self, AuditRecord};
 use crate::config::{unique_paths, AppSettings, ConfigPaths, LlmConfig, VendorConfig};
 use crate::fonts::install_cjk_fonts;
 use crate::history::{self, ChapterRevision};
 use crate::inkoswin_prompt;
-use crate::llm::{spawn_chat, spawn_fetch_models, spawn_ping, ChatMessage, LlmTask, ModelsFetchTask};
+use crate::llm::{
+    spawn_chat, spawn_fetch_models, spawn_generate_init_settings, spawn_ping, ChatMessage, LlmTask,
+    ModelsFetchTask,
+};
 use crate::oplog::{self, OpLogEntry};
 use crate::project::{self, NovelProject, ProjectStore};
-use crate::state_sync::{self, StateFileChange};
+use crate::state_sync::{self, StateFileChange, StateUpdate};
 use crate::theme::{self, color, dim_label, page_header, section_label};
 use crate::vendors::{find as find_vendor, VENDORS};
 use crate::version_info;
@@ -185,6 +187,11 @@ const GENRES: &[&str] = &[
     "悬疑", "轻小说", "言情", "校园", "推理", "灵异", "恐怖", "商战", "职场", "其他",
 ];
 
+/// 新建小说向导：收窄的「小说类型」（仍写入 `novel_project.genre`，与全书其它处一致）。
+const WIZARD_STORY_KINDS: &[&str] = &[
+    "玄幻", "都市", "科幻", "悬疑", "言情", "奇幻", "武侠", "仙侠", "其它",
+];
+
 pub struct InkOsApp {
     paths: ConfigPaths,
     settings: AppSettings,
@@ -234,6 +241,19 @@ pub struct InkOsApp {
     /// 审计记录侧栏选中的 timestamp，None 表示未选中（显示当次最新的实时结果）。
     selected_audit_ts: Option<String>,
 
+    /// 从最近一次审计「末尾 JSON」解析出的程序化动作卡片（仅 Audit  Tab 有意义）。
+    review_audit_actions: Vec<crate::state_sync::ReviewAction>,
+    review_audit_parse_note: String,
+    /// 与各 `review_audit_actions` 项对齐，标记该行动是否已由用户触发并成功执行完毕。
+    review_audit_action_done: Vec<bool>,
+    /// 审计页「文笔优化」单条动作的串行改写任务。
+    audit_text_rewrite_task: Option<LlmTask>,
+    /// `audit_text_rewrite_task` 改写目标章节及其替换前的快照正文。
+    audit_text_rewrite_chapter: Option<i32>,
+    audit_text_rewrite_old_body: String,
+    /// 文笔优化成功后置为已完成（与 [`Self::refresh_review_audit_actions`] 对齐的索引）。
+    audit_text_rewrite_pending_idx: Option<usize>,
+
     /// 替换原文后链式触发的「状态档案同步」LLM 任务。
     state_sync_task: Option<LlmTask>,
     state_sync_phase: StateSyncPhase,
@@ -264,6 +284,9 @@ pub struct InkOsApp {
     /// 「AI 生成本章节拍」LLM 任务（与 manual_gen_task 隔离，互不阻塞）。
     beats_gen_task: Option<LlmTask>,
     beats_gen_target: Option<i32>,
+
+    /// 第一章完成后：独立 LLM 子任务，从正文提取悬念钩子并写入 pending_hooks.md。
+    hooks_extract_task: Option<LlmTask>,
 
     // 「AI 生成 book_rules.md」专用任务（对齐 Narcooo/inkos 的 architect.bookRulesPrompt）。
     // 与 manual_gen_task 隔离，避免与正文生成互相阻塞。
@@ -367,6 +390,8 @@ pub struct InkOsApp {
     wizard_dir: String,
     /// 向导临时编辑的小说设定
     wizard_project: NovelProject,
+    /// 新建小说向导「AI 灵感生成」LLM 任务
+    wizard_init_settings_task: Option<LlmTask>,
 }
 
 impl InkOsApp {
@@ -430,6 +455,13 @@ impl InkOsApp {
             rewrite_buf_for_chapter: None,
             audit_records: Vec::new(),
             selected_audit_ts: None,
+            review_audit_actions: Vec::new(),
+            review_audit_parse_note: String::new(),
+            review_audit_action_done: Vec::new(),
+            audit_text_rewrite_task: None,
+            audit_text_rewrite_chapter: None,
+            audit_text_rewrite_old_body: String::new(),
+            audit_text_rewrite_pending_idx: None,
             state_sync_task: None,
             state_sync_phase: StateSyncPhase::Idle,
             state_sync_log: Vec::new(),
@@ -448,6 +480,7 @@ impl InkOsApp {
             beats_dirty: false,
             beats_gen_task: None,
             beats_gen_target: None,
+            hooks_extract_task: None,
             book_rules_gen_task: None,
             pending_book_rules_confirm: false,
             pending_book_rules_sync_on_save: false,
@@ -522,6 +555,7 @@ impl InkOsApp {
             novel_wizard_open: false,
             wizard_dir: String::new(),
             wizard_project: NovelProject::default(),
+            wizard_init_settings_task: None,
         };
 
         if !app.settings.default_novel_path.is_empty() {
@@ -575,6 +609,7 @@ impl InkOsApp {
         self.beats_dirty = false;
         self.beats_gen_task = None;
         self.beats_gen_target = None;
+        self.hooks_extract_task = None;
         self.book_rules_gen_task = None;
         self.pending_book_rules_confirm = false;
         self.pending_book_rules_sync_on_save = false;
@@ -1051,6 +1086,9 @@ impl InkOsApp {
         if self.beats_gen_task.is_some() {
             return Some("请先完成或取消节拍生成".into());
         }
+        if self.hooks_extract_task.is_some() {
+            return Some("第一章悬念提取正在进行".into());
+        }
         if self.book_rules_gen_task.is_some() {
             return Some("请先完成或取消 book_rules 生成".into());
         }
@@ -1526,6 +1564,7 @@ impl eframe::App for InkOsApp {
         self.show_book_rules_confirm_modal(ctx);
         self.show_novel_wizard(ctx);
         self.show_hooks_tracker_window(ctx);
+        self.show_audit_text_rewrite_window(ctx);
     }
 }
 
@@ -1590,9 +1629,70 @@ impl InkOsApp {
                         }
                     }
                 }
+                let audit_parse_on_success = task_error.is_none()
+                    && matches!(self.review_mode, ReviewMode::Audit);
                 self.review_task = None;
+                if audit_parse_on_success {
+                    self.refresh_review_audit_actions();
+                }
             } else {
                 any_running = true;
+            }
+        }
+        if let Some(task) = &mut self.audit_text_rewrite_task {
+            let updated = task.drain();
+            if updated || (!task.done && task.streaming) {
+                ctx.request_repaint();
+            }
+            if !task.done {
+                any_running = true;
+            }
+            if task.done {
+                let acc_trim = task.accumulated.trim().to_string();
+                let err = task.error.clone();
+                let chap_opt = std::mem::take(&mut self.audit_text_rewrite_chapter);
+                let old_snap = std::mem::take(&mut self.audit_text_rewrite_old_body);
+                let pending_idx = std::mem::take(&mut self.audit_text_rewrite_pending_idx);
+                self.audit_text_rewrite_task = None;
+
+                match err {
+                    Some(e) => {
+                        let msg = if acc_trim.is_empty() {
+                            format!("审计文笔优化失败：{e}")
+                        } else {
+                            format!("审计文笔优化出错（未写入本章）：{e}")
+                        };
+                        self.status_message = msg;
+                    }
+                    None => match chap_opt {
+                        None => {
+                            self.status_message = "审计文笔优化无效：缺少目标章节".into();
+                        }
+                        Some(_n) if acc_trim.is_empty() => {
+                            self.status_message = "审计文笔优化返回为空，未改写本章".into();
+                        }
+                        Some(n) => {
+                            let ok = self.persist_chapter_after_ai_rewrite(
+                                n,
+                                &acc_trim,
+                                &old_snap,
+                                "audit_text_rewrite",
+                                "审计文笔优化改写",
+                                "来自审计「优化文笔」",
+                            );
+                            if ok {
+                                if let Some(i) = pending_idx {
+                                    if let Some(slot) =
+                                        self.review_audit_action_done.get_mut(i)
+                                    {
+                                        *slot = true;
+                                    }
+                                }
+                            }
+                        }
+                    },
+                }
+                ctx.request_repaint();
             }
         }
         if let Some(task) = &mut self.state_sync_task {
@@ -1670,6 +1770,14 @@ impl InkOsApp {
                 any_running = true;
             }
         }
+        if let Some(task) = &mut self.hooks_extract_task {
+            task.drain();
+            if task.done {
+                self.handle_hooks_extract_done();
+            } else {
+                any_running = true;
+            }
+        }
         if let Some(task) = &mut self.book_rules_gen_task {
             task.drain();
             let snapshot = if !task.done && !task.accumulated.is_empty() {
@@ -1723,6 +1831,37 @@ impl InkOsApp {
                         format!("✓  已获取 {} 个模型（点击列表项填入「默认模型」）", self.vendor_models_list.len());
                 }
                 self.vendor_models_task = None;
+            } else {
+                any_running = true;
+            }
+        }
+        if let Some(task) = &mut self.wizard_init_settings_task {
+            task.drain();
+            if task.done {
+                let acc = task.accumulated.clone();
+                let err_opt = task.error.clone();
+                self.wizard_init_settings_task = None;
+                let parsed = inkoswin_prompt::parse_init_settings_output(&acc);
+                parsed.merge_into(&mut self.wizard_project);
+                let any_filled = !parsed.premise.trim().is_empty()
+                    || !parsed.protagonists.trim().is_empty()
+                    || !parsed.world_setting.trim().is_empty()
+                    || !parsed.writing_style.trim().is_empty();
+                self.status_message = if let Some(e) = err_opt {
+                    if !any_filled && acc.trim().is_empty() {
+                        format!("AI 灵感生成失败：{e}")
+                    } else {
+                        format!("AI 灵感已部分填入（请求异常）：{e}")
+                    }
+                } else if !any_filled {
+                    if acc.trim().is_empty() {
+                        "AI 灵感生成完成，但响应为空；请检查模型或重试。".into()
+                    } else {
+                        "AI 灵感生成完成，但未能解析出四段；可直接编辑或重试。".into()
+                    }
+                } else {
+                    "AI 灵感生成完成，已填入设定字段；可继续修改。".into()
+                };
             } else {
                 any_running = true;
             }
@@ -2973,6 +3112,51 @@ impl InkOsApp {
         }
     }
 
+    /// 「审计程序化 · 文笔优化」LLM 请求期间的小窗：展示流式输出与字数统计。
+    fn show_audit_text_rewrite_window(&mut self, ctx: &egui::Context) {
+        let Some(task_ref) = self.audit_text_rewrite_task.as_ref() else {
+            return;
+        };
+        let acc_snapshot = task_ref.accumulated.clone();
+        let stats = task_ref.stats_label();
+        let chap = self.audit_text_rewrite_chapter;
+        let awaiting = task_ref.streaming && !task_ref.done;
+
+        egui::Window::new("✍  审计 · 文笔优化进度")
+            .anchor(egui::Align2::RIGHT_TOP, [-20.0, 56.0])
+            .default_width(420.0)
+            .max_width(620.0)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(stats)
+                        .size(11.0)
+                        .monospace()
+                        .color(color::TEXT_DIM),
+                );
+                if let Some(nc) = chap {
+                    ui.label(RichText::new(format!("改写目标：第 {nc} 章")).size(12.5));
+                }
+                if awaiting {
+                    ui.label(
+                        RichText::new("模型正在撰写完整章节……").color(color::ACCENT_HI),
+                    );
+                }
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .max_height(340.0)
+                    .stick_to_bottom(true)
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        if acc_snapshot.trim().is_empty() {
+                            dim_label(ui, "（暂无输出正文）");
+                        } else {
+                            ui.label(RichText::new(acc_snapshot.trim_end_matches(['\r', '\n'])).size(12.0));
+                        }
+                    });
+            });
+    }
+
     fn ui_foreshadow_card(&mut self, ui: &mut egui::Ui) {
         let count = self.pending_hooks_summary.len();
         let mut goto_state = false;
@@ -3180,6 +3364,46 @@ impl InkOsApp {
         }
     }
 
+    fn try_start_wizard_init_settings(&mut self) {
+        if self.wizard_init_settings_task.is_some() {
+            return;
+        }
+        let title = self.wizard_project.title.trim();
+        let genre = self.wizard_project.genre.trim();
+        if title.is_empty() || genre.is_empty() {
+            self.status_message = "请先填写小说名称并选择小说类型。".into();
+            return;
+        }
+        let vendor_id = self.settings.writing_vendor.clone();
+        if vendor_id.is_empty() {
+            self.status_message = "请先在「设置」中选择写作 LLM 服务商。".into();
+            return;
+        }
+        let Some(cfg) = self.vendor_config(&vendor_id) else {
+            self.status_message = "写作 LLM 服务商配置不存在。".into();
+            return;
+        };
+        if !cfg.is_configured() {
+            self.status_message = "所选写作服务商未完整配置。".into();
+            return;
+        }
+        let model = cfg.model.trim().to_string();
+        if model.is_empty() {
+            self.status_message = "请为写作服务商设置默认模型。".into();
+            return;
+        }
+
+        let (system, user) = inkoswin_prompt::generate_init_settings_prompt(title, genre);
+        let messages = vec![ChatMessage::system(system), ChatMessage::user(user)];
+        self.wizard_init_settings_task = Some(spawn_generate_init_settings(
+            cfg,
+            vendor_id,
+            model,
+            messages,
+        ));
+        self.status_message = "AI 正在构思宏大世界观…".into();
+    }
+
     fn show_novel_wizard(&mut self, ctx: &egui::Context) {
         if !self.novel_wizard_open {
             return;
@@ -3192,6 +3416,7 @@ impl InkOsApp {
         let mut open = true;
         let mut want_create = false;
         let mut want_pick_dir = false;
+        let mut want_generate_init = false;
 
         egui::Window::new("✨  新建小说")
             .id(egui::Id::new("novel_wizard_window"))
@@ -3260,17 +3485,17 @@ impl InkOsApp {
                     .show(ui, |ui| {
                         field(ui, "标题 *", &mut self.wizard_project.title, "小说名称", "wz_title");
 
-                        // 题材下拉
-                        ui.label(RichText::new("题材 *").size(11.5).color(color::TEXT_DIM));
-                        ComboBox::from_id_salt("wz_genre")
+                        // 小说类型（收窄选项，存入 `novel_project.genre`）
+                        ui.label(RichText::new("小说类型 *").size(11.5).color(color::TEXT_DIM));
+                        ComboBox::from_id_salt("wz_story_kind")
                             .width(200.0)
                             .selected_text(if self.wizard_project.genre.is_empty() {
-                                "请选择题材"
+                                "请选择类型"
                             } else {
                                 &self.wizard_project.genre
                             })
                             .show_ui(ui, |ui| {
-                                for g in GENRES {
+                                for g in WIZARD_STORY_KINDS {
                                     if ui.selectable_label(self.wizard_project.genre == *g, *g).clicked() {
                                         self.wizard_project.genre = (*g).to_string();
                                     }
@@ -3305,16 +3530,39 @@ impl InkOsApp {
                     });
 
                 ui.add_space(8.0);
-                dim_label(ui, "* 标题、题材、故事核心为必填项，缺失将无法触发 AI 生成。");
+                dim_label(ui, "* 标题、小说类型、故事核心为必填项；可用「AI 灵感生成」按需填充设定。");
                 ui.add_space(8.0);
                 ui.separator();
                 ui.add_space(6.0);
 
                 ui.horizontal(|ui| {
+                    let title_ok = !self.wizard_project.title.trim().is_empty();
+                    let genre_ok = !self.wizard_project.genre.trim().is_empty();
                     let can_create = !self.wizard_dir.is_empty()
-                        && !self.wizard_project.title.trim().is_empty()
-                        && !self.wizard_project.genre.trim().is_empty()
+                        && title_ok
+                        && genre_ok
                         && !self.wizard_project.premise.trim().is_empty();
+                    let busy = self.wizard_init_settings_task.is_some();
+                    let can_ai = title_ok && genre_ok && !busy;
+
+                    ui.add_enabled_ui(can_ai, |ui| {
+                        if ui
+                            .button(RichText::new("AI 灵感生成").strong())
+                            .on_hover_text(
+                                "按 [故事核心 / 前提] 等四段 Markdown 模板调用写作 LLM，填入下方四个文本框（可再手改）",
+                            )
+                            .clicked()
+                        {
+                            want_generate_init = true;
+                        }
+                    });
+                    if busy {
+                        ui.label(
+                            RichText::new("AI 正在构思宏大世界观…")
+                                .color(color::ACCENT_HI)
+                                .italics(),
+                        );
+                    }
                     ui.add_enabled_ui(can_create, |ui| {
                         if ui.button(RichText::new("🚀  创建小说档案").strong()).clicked() {
                             want_create = true;
@@ -3336,6 +3584,10 @@ impl InkOsApp {
                     }
                 }
             }
+        }
+
+        if want_generate_init {
+            self.try_start_wizard_init_settings();
         }
 
         if want_create {
@@ -4014,6 +4266,9 @@ impl InkOsApp {
 
         if clear_result {
             self.review_result.clear();
+            self.review_audit_actions.clear();
+            self.review_audit_parse_note.clear();
+            self.review_audit_action_done.clear();
             self.review_for_chapter = None;
             self.selected_audit_ts = None;
         }
@@ -4285,15 +4540,192 @@ impl InkOsApp {
                             );
                         }
                     } else {
-                        let display = if self.review_task.is_some() {
-                            format!("{}{}", self.review_result, typewriter_cursor(ui.ctx()))
+                        let display_owned = if self.review_task.is_some() {
+                            format!(
+                                "{}{}",
+                                self.review_result,
+                                typewriter_cursor(ui.ctx())
+                            )
                         } else {
                             self.review_result.clone()
                         };
-                        CommonMarkViewer::new().show(ui, &mut self.cm_cache, &display);
+                        let md_view =
+                            state_sync::strip_audit_trailing_json_fence(&display_owned);
+                        CommonMarkViewer::new()
+                            .show(ui, &mut self.cm_cache, md_view.as_ref());
                     }
                 });
+            ui.add_space(10.0);
+            self.ui_review_audit_action_cards(ui);
         });
+    }
+
+    fn ui_review_audit_action_cards(&mut self, ui: &mut egui::Ui) {
+        let busy_rewrite = self.audit_text_rewrite_task.is_some();
+
+        if self.review_task.is_some() {
+            ui.add_space(4.0);
+            dim_label(ui, "流式输出未完成；文末 JSON 与行动卡片将在本轮请求结束后刷新。");
+            return;
+        }
+
+        if !self.review_audit_parse_note.is_empty() {
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(&self.review_audit_parse_note)
+                    .size(11.5)
+                    .color(color::TEXT_DIM),
+            );
+        }
+
+        if self.review_audit_actions.is_empty() {
+            return;
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.label(RichText::new("审计 · 程序化行动").size(12.8).strong());
+        ui.add_space(8.0);
+
+        for idx in 0..self.review_audit_actions.len() {
+            let act = self.review_audit_actions[idx].clone();
+            let ty = act.action_type.to_lowercase();
+            let done = self.review_audit_action_done.get(idx).copied().unwrap_or(false);
+
+            let title_line = act.title.trim();
+            let title_disp = if title_line.is_empty() {
+                "(无标题)".to_string()
+            } else {
+                title_line.to_string()
+            };
+
+            let badge: String = match ty.as_str() {
+                "state_sync" => "同步档案".into(),
+                "text_rewrite" => "优化文笔".into(),
+                other => format!("动作 · {other}"),
+            };
+
+            let payload_compact = serde_json::to_string(&act.payload)
+                .unwrap_or_else(|_| "(payload 序列化失败)".into());
+            let truncated: String = payload_compact.chars().take(220).collect();
+            let tail = if payload_compact.chars().count() > 220 {
+                "…"
+            } else {
+                ""
+            };
+            let payload_hint = format!("{truncated}{tail}");
+
+            egui::Frame::default()
+                .fill(color::SURFACE)
+                .stroke(Stroke::new(1.0, color::BORDER))
+                .corner_radius(CornerRadius::same(10))
+                .inner_margin(Margin::same(14))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&title_disp).size(13.5).strong());
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(&badge)
+                                .size(11.5)
+                                .color(color::ACCENT_HI),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if done {
+                                    ui.label(
+                                        RichText::new("✓ 已执行")
+                                            .color(color::SUCCESS)
+                                            .small(),
+                                    );
+                                }
+                            },
+                        );
+                    });
+                    ui.add_space(6.0);
+                    if !act.description.trim().is_empty() {
+                        ui.label(
+                            RichText::new(&act.description)
+                                .size(12.5)
+                                .color(color::TEXT),
+                        );
+                        ui.add_space(6.0);
+                    }
+
+                    ui.label(
+                        RichText::new(&payload_hint)
+                            .size(11.0)
+                            .color(color::TEXT_FAINT)
+                            .monospace(),
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| match ty.as_str() {
+                        "state_sync" => {
+                            let mut clicked = false;
+                            ui.add_enabled_ui(!done, |ui| {
+                                if ui
+                                    .button("同步档案到 story_state")
+                                    .on_hover_text(
+                                        "将 payload（StateUpdate JSON）安全写入白名单下的 story_state 档案",
+                                    )
+                                    .clicked()
+                                {
+                                    clicked = true;
+                                }
+                            });
+                            if clicked {
+                                self.try_apply_audit_state_sync_action(idx);
+                            }
+                        }
+                        "text_rewrite" => {
+                            let rp = act
+                                .payload
+                                .get("rewrite_prompt")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let can = !rp.trim().is_empty() && !done && !busy_rewrite;
+                            let mut clicked = false;
+                            ui.add_enabled_ui(can, |ui| {
+                                if ui
+                                    .button("优化文笔并重写本章")
+                                    .on_hover_text(
+                                        "按 payload.rewrite_prompt 再调一次 LLM，完成后自动替换本章正文并链式刷新状态档案",
+                                    )
+                                    .clicked()
+                                {
+                                    clicked = true;
+                                }
+                            });
+                            if clicked {
+                                self.start_audit_text_rewrite_from_prompt(idx, rp);
+                            }
+                        }
+                        _ => {}
+                    });
+
+                    match ty.as_str() {
+                        "state_sync" if self.store.is_none() || self.novel_path.is_none() => {
+                            dim_label(ui, "需要先打开小说目录与项目数据后，才能写 story_state。");
+                        }
+                        "text_rewrite" => {
+                            let empty_prompt = act
+                                .payload
+                                .get("rewrite_prompt")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.trim().is_empty())
+                                .unwrap_or(true);
+                            if empty_prompt {
+                                dim_label(ui, "payload 缺少可用的 rewrite_prompt（非空字符串）。");
+                            }
+                        }
+                        _ => {}
+                    }
+                });
+
+            ui.add_space(10.0);
+        }
     }
 
     fn ui_review_rewrite_body(&mut self, ui: &mut egui::Ui) {
@@ -4458,6 +4890,9 @@ impl InkOsApp {
             rec.time,
             rec.chars
         );
+        if target_mode == ReviewMode::Audit {
+            self.refresh_review_audit_actions();
+        }
     }
 
     /// 审核 / 改写：上次 LLM 请求是否以失败结束（与 `poll_llm_tasks` 写入的文案对齐）。
@@ -4515,17 +4950,53 @@ impl InkOsApp {
 
         let messages = vec![
             ChatMessage::system(
-                "你是一名严谨的网文/小说审稿编辑。请用 Markdown 输出审稿意见，包含：\n\
-                 1. 总体评分（1-10）；\n\
-                 2. 优点（不超过 5 条）；\n\
-                 3. 问题与改进建议（按重要性排序）；\n\
-                 4. 与「状态档案 / 人物 / 世界 / 已埋伏笔」的一致性检查（指出具体出处）；\n\
-                 5. 一段示范修改（任选一处问题）。\n不要复述原文。",
+                r##"你是一名严谨的网文/小说审稿编辑。你必须按「先人类可读、后机器可读」两部分顺序输出全文，不得调换顺序，不得省略第二部分。
+
+【第一部分：Markdown 审稿正文】
+仅使用 Markdown 书写（本部分不要用任何代码围栏包裹），依次包含：
+1. 总体评分（1–10）；
+2. 优点（不超过 5 条）；
+3. 问题与改进建议（按重要性排序，条目应具体可执行）；
+4. 与「状态档案 / 角色 / 世界观 / 伏笔」的一致性结论；若发现正文与档案冲突，须写清冲突点及所依据的档案文件名或段落线索。
+
+禁止大段复述章节原文；「示范修改」可写在第 3 点中作为短例，不必单独成章。
+
+【第二部分：机器可读动作 JSON（必填）】
+在第一部分全部输出完毕后，另起一行输出且仅输出一个围栏代码块：
+- 第一行必须是：```json（三个反引号 + 小写 json，行尾无多余字符）
+- 紧接着是单行或多行合法 JSON，可被严格解析为：`{ "actions": [ ... ] }`
+- 最后一行必须是单独一行的三个反引号，表示围栏结束
+
+根对象仅含字段 `actions`（数组）。每一项为对象，字段固定为：
+- `title`（string）：动作短标题。
+- `action_type`（string）：仅允许 `"state_sync"` 或 `"text_rewrite"`。
+- `description`（string）：简要说明为何需要该动作。
+- `payload`（object）：随 `action_type` 变化，见下。
+
+当 `action_type` 为 `"state_sync"`（同步 `story_state` 下档案，修正与正文不一致的设定）时，`payload` 必须直接符合 StateUpdate 的三个 string 字段：
+- `file`：状态档案文件名（如 `current_state.md`、`character_matrix.md`、`particle_ledger.md` 等）；须与上文用户给出的状态档案上下文一致，勿编造未出现的文件名。
+- `action`：仅 `"replace"` 或 `"patch"`。`replace` 时 `content` 为替换后的完整文件正文；`patch` 时 `content` 为可定位的修改说明及替换后文本（语义上应能应用，避免空洞描述）。
+- `content`：与 `action` 配套的档案正文或补丁内容。
+
+当 `action_type` 为 `"text_rewrite"`（针对文笔、节奏、对话等，需后续由写作模型改正文）时，`payload` 须包含可执行的改写指令，必须使用字段：
+- `rewrite_prompt`（string）：可直接交给下游写作 LLM 的中文提示，写清要改的段落位置、风格/节奏要求、须保留的情节与禁止事项等。
+
+请确保输出的 JSON 内容与 Markdown 意见中的建议一一对应，不要遗漏关键的档案同步任务。
+
+规则摘要：
+- 发现档案与正文不一致（等级、人设、地点、时间线、伏笔状态等）→ 必须至少一条 `state_sync`，且 `payload` 为合法 StateUpdate。
+- 主要为文笔、结构、对话问题且无需改档案 → 使用 `text_rewrite`，`rewrite_prompt` 写具体。
+- 可同时存在多条 `actions`；若确实无需程序化处理，输出 `"actions":[]`。
+- JSON 围栏外不得再输出任何字符。
+"##,
             ),
             ChatMessage::user(user_prompt),
         ];
         let model = cfg.model.clone();
         self.review_result.clear();
+        self.review_audit_actions.clear();
+        self.review_audit_parse_note.clear();
+        self.review_audit_action_done.clear();
         self.review_for_chapter = Some(n);
         let streaming = self.settings.review_streaming;
         self.review_task = Some(spawn_chat(cfg, vendor_id, model, messages, streaming));
@@ -4647,21 +5118,57 @@ impl InkOsApp {
 
     fn replace_chapter_with_rewrite(&mut self) {
         let Some(n) = self.review_for_chapter else { return };
-        let new_body = self.review_result.trim().to_string();
-        if new_body.is_empty() {
-            self.status_message = "改写结果为空，无法替换".into();
+        let (Some(store), Some(_)) = (&self.store, &self.project) else {
+            self.status_message = "项目未就绪，无法写入".into();
             return;
+        };
+        let old_body = if !self.review_target_original.is_empty() {
+            self.review_target_original.clone()
+        } else {
+            store.load_chapter_content(n).map(|(_, b)| b).unwrap_or_default()
+        };
+        let nb = self.review_result.trim().to_string();
+        let _ = self.persist_chapter_after_ai_rewrite(
+            n,
+            &nb,
+            &old_body,
+            "ai_rewrite",
+            "AI 改写替换原文",
+            "来自 AI 改写",
+        );
+    }
+
+    /// 备份后写入 `chapters/` 并按需链式触发 `story_state/` LLM 同步。
+    ///
+    /// `history_*`：章节历史快照元数据；`replace_oplog_detail`：`oplog.try_append(..., ..., detail)`。
+    fn persist_chapter_after_ai_rewrite(
+        &mut self,
+        n: i32,
+        new_body: &str,
+        old_body_snapshot: &str,
+        history_kind: &'static str,
+        history_detail: &'static str,
+        replace_oplog_detail: &'static str,
+    ) -> bool {
+        let trimmed = new_body.trim();
+        if trimmed.is_empty() {
+            self.status_message = "改写结果为空，无法替换".into();
+            return false;
         }
         let novel_root = self.novel_path.clone();
-        let (Some(store), Some(project)) = (&self.store, &mut self.project) else { return };
+        let (Some(store), Some(project)) = (&self.store, &mut self.project) else {
+            self.status_message = "项目未就绪，无法写入".into();
+            return false;
+        };
         let (cur_title, cur_beats) = project
             .chapters
             .iter()
             .find(|c| c.number == n)
             .map(|c| (c.title.clone(), c.beats.clone()))
             .unwrap_or_default();
-        let old_body = if !self.review_target_original.is_empty() {
-            self.review_target_original.clone()
+
+        let old_body = if !old_body_snapshot.is_empty() {
+            old_body_snapshot.to_string()
         } else {
             store.load_chapter_content(n).map(|(_, b)| b).unwrap_or_default()
         };
@@ -4672,9 +5179,9 @@ impl InkOsApp {
                 n,
                 &cur_title,
                 &old_body,
-                &new_body,
-                "ai_rewrite",
-                "AI 改写替换原文",
+                trimmed,
+                history_kind,
+                history_detail,
             ) {
                 Ok(rev) => {
                     self.auto_gen_log.push(format!(
@@ -4697,25 +5204,267 @@ impl InkOsApp {
             }
         }
 
-        let save_result = store.save_chapter(project, n, &cur_title, &new_body, "review", "", &cur_beats);
+        let save_result = store.save_chapter(project, n, &cur_title, trimmed, "review", "", &cur_beats);
         match save_result {
             Ok(()) => {
-                self.status_message = format!("已用 AI 改写替换第 {n} 章正文（状态置为待审核）");
+                self.status_message = if history_kind == "audit_text_rewrite" {
+                    format!("已将审计文笔优化写入第 {n} 章正文（待审核）；状态档案同步已发起（若可选）")
+                } else {
+                    format!("已用 AI 改写替换第 {n} 章正文（状态置为待审核）")
+                };
                 oplog::try_append(
                     novel_root.as_deref(),
                     "替换原文",
-                    &format!("第 {n} 章 · 来自 AI 改写"),
+                    &format!("第 {n} 章 · {replace_oplog_detail}"),
                 );
                 if self.selected_chapter == Some(n) {
                     self.select_chapter(n);
                 }
-                // 链式触发状态档案同步（第二次 LLM 调用）
-                self.start_state_sync(n, &old_body, &new_body);
+                self.start_state_sync(n, &old_body, trimmed);
+                true
             }
-            Err(e) => self.status_message = format!("替换失败：{e}"),
+            Err(e) => {
+                self.status_message = format!("替换失败：{e}");
+                false
+            }
         }
     }
 
+    /// 完成后从全文尾部 JSON 围栏解析程序化动作卡片。
+    fn refresh_review_audit_actions(&mut self) {
+        self.review_audit_parse_note.clear();
+        let raw = self.review_result.trim();
+        if raw.is_empty() {
+            self.review_audit_actions.clear();
+            self.review_audit_action_done.clear();
+            return;
+        }
+        match state_sync::parse_review_audit_report(raw) {
+            Ok(r) => {
+                let cnt = r.actions.len();
+                self.review_audit_actions = r.actions;
+                self.review_audit_action_done
+                    .resize(self.review_audit_actions.len(), false);
+                self.review_audit_parse_note = if cnt > 0 {
+                    format!("已解析末尾 JSON：{cnt} 条可执行动作")
+                } else {
+                    "已解析末尾 JSON：无程序化动作（actions 为空）".into()
+                };
+            }
+            Err(e) => {
+                self.review_audit_actions.clear();
+                self.review_audit_action_done.clear();
+                self.review_audit_parse_note = format!("未解析程序化 JSON：{}", e);
+            }
+        }
+    }
+
+    /// 卡片「同步档案」：将单条 AI 动作的 `payload` 作为 [`StateUpdate`] 应用至 `story_state/`。
+    fn try_apply_audit_state_sync_action(&mut self, idx: usize) {
+        if idx >= self.review_audit_actions.len() {
+            return;
+        }
+        if self
+            .review_audit_action_done
+            .get(idx)
+            .copied()
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let is_state_sync = self
+            .review_audit_actions
+            .get(idx)
+            .is_some_and(|a| a.action_type.to_lowercase() == "state_sync");
+        if !is_state_sync {
+            return;
+        }
+        let payload = match self.review_audit_actions.get(idx) {
+            Some(a) => a.payload.clone(),
+            None => return,
+        };
+        let upd: StateUpdate = match serde_json::from_value(payload) {
+            Ok(u) => u,
+            Err(e) => {
+                self.status_message = format!(
+                    "payload 不符合 StateUpdate 结构（动作 {}）：{e}",
+                    idx + 1
+                );
+                return;
+            }
+        };
+
+        let Some(novel_root) = self.novel_path.clone() else {
+            self.status_message = "未打开项目目录".into();
+            return;
+        };
+        let Some(state_dir) = self.store.as_ref().map(|s| s.state_dir()) else {
+            self.status_message = "内部错误：无 story_state 目录".into();
+            return;
+        };
+
+        let title_hint = self
+            .review_audit_actions
+            .get(idx)
+            .map(|a| {
+                let t = a.title.trim();
+                if t.is_empty() {
+                    "同步档案".to_string()
+                } else {
+                    t.to_string()
+                }
+            })
+            .unwrap_or_else(|| "同步档案".into());
+
+        let report = state_sync::StateSyncReport {
+            summary: format!("审计程序化动作 · {title_hint}"),
+            updates: vec![upd],
+        };
+        let changes = state_sync::apply_updates(&novel_root, &state_dir, &report, STATE_FILES);
+
+        self.state_sync_log.push(format!(
+            "{}  审计程序化 · 档案同步 「{}」",
+            short_time(),
+            title_hint
+        ));
+
+        let mut fatal = false;
+        for change in &changes {
+            fatal |= change.note.contains("写盘失败") || change.note.contains("备份失败");
+            self.state_sync_log.push(format!(
+                "{}  · {} action={} 旧{}字→新{}字{}",
+                short_time(),
+                change.file,
+                change.action,
+                change.old_chars,
+                change.new_chars,
+                if change.note.is_empty() {
+                    String::new()
+                } else {
+                    format!("（{}）", change.note)
+                },
+            ));
+        }
+
+        let materially_updated = changes.iter().any(|c| {
+            !c.note.starts_with("跳过")
+                && !(c.note.contains("写盘失败") || c.note.contains("备份失败"))
+                && c.new_chars != c.old_chars
+        });
+
+        let files = changes.iter().map(|c| c.file.as_str()).collect::<Vec<_>>();
+
+        self.status_message = if fatal || !materially_updated {
+            format!("档案同步未完成或未实际改动 · {}（见状态档案日志）", title_hint)
+        } else {
+            format!("已通过审计动作更新档案 · {}", title_hint)
+        };
+
+        oplog::try_append(
+            self.novel_path.as_deref(),
+            "审计程序化 · 档案同步",
+            &format!("{} · {}", title_hint, files.join(", ")),
+        );
+
+        let ok_done = materially_updated && !fatal;
+        if ok_done && idx < self.review_audit_action_done.len() {
+            self.review_audit_action_done[idx] = true;
+        }
+    }
+
+    fn start_audit_text_rewrite_from_prompt(&mut self, action_idx: usize, rewrite_prompt: String) {
+        if self.audit_text_rewrite_task.is_some() {
+            self.status_message = "文笔优化任务进行中…".into();
+            return;
+        }
+        let prompt_stripped = rewrite_prompt.trim().to_string();
+        if prompt_stripped.is_empty() {
+            self.status_message = "改写指令为空".into();
+            return;
+        }
+        let vendor_id = self.settings.review_vendor.clone();
+        if vendor_id.is_empty() {
+            self.status_message = "请先选择审核 AI".into();
+            return;
+        }
+        let Some(cfg) = self.vendor_config(&vendor_id) else {
+            self.status_message = "服务商配置不存在".into();
+            return;
+        };
+        if !cfg.is_configured() {
+            self.status_message = "所选服务商未完整配置".into();
+            return;
+        }
+        let Some(n) = self.review_for_chapter.or(self.review_target) else {
+            self.status_message = "请先选定章节".into();
+            return;
+        };
+        let Some(ref store) = self.store else { return };
+        let (title, body) = match store.load_chapter_content(n) {
+            Ok(v) => v,
+            Err(e) => {
+                self.status_message = format!("读取章节失败：{e}");
+                return;
+            }
+        };
+        self.audit_text_rewrite_old_body = body.clone();
+        self.audit_text_rewrite_chapter = Some(n);
+
+        let project_brief = self
+            .project
+            .as_ref()
+            .map(|p| {
+                format!(
+                    "小说名：{}\n题材：{}\n核心：{}\n",
+                    p.title.trim(),
+                    p.genre.trim(),
+                    p.premise.trim()
+                )
+            })
+            .unwrap_or_default();
+        let state_docs = self.collect_state_docs_for_prompt(4000);
+
+        let user_prompt = format!(
+            "## 项目背景\n{project_brief}\n## 状态档案（务必保持一致）\n{}\n\
+             \n## 审计程序化改写指令（必须逐项落实）\n{prompt_stripped}\n\
+             \n## 章节标题\n{title}\n\n## 原文\n{body}",
+            if state_docs.is_empty() {
+                "（无）".to_string()
+            } else {
+                state_docs
+            }
+        );
+
+        let messages = vec![
+            ChatMessage::system(
+                "你是一名一线网文/小说编辑。请基于下面的项目背景、状态档案、程序化改写指令与原文，输出**完整的改写后章节正文**：\n\
+                 - 仅输出改写后的正文，不要解释、不要前言、不要代码块包裹；\n\
+                 - **严格遵照**上文「程序化改写指令」逐项修改；\n\
+                 - 严格遵守 book_rules.md 中的 personalityLock / behavioralConstraints / prohibitions / forbidden 列表（若状态中可见）；\n\
+                 - 保持人物动机、关键事件、伏笔与原章节一致；\n\
+                 - 修复语病、强化节奏，保留中文标点习惯。",
+            ),
+            ChatMessage::user(user_prompt),
+        ];
+        let model = cfg.model.clone();
+        let streaming = self.settings.review_streaming;
+        self.audit_text_rewrite_task =
+            Some(spawn_chat(cfg, vendor_id.clone(), model, messages, streaming));
+
+        self.audit_text_rewrite_pending_idx = Some(action_idx);
+        self.status_message = format!(
+            "审计文笔优化已发起 · 第 {n} 章（流式：{}）",
+            if streaming { "开" } else { "关" }
+        );
+        oplog::try_append(
+            self.novel_path.as_deref(),
+            "审计程序化 · 文笔优化",
+            &format!(
+                "第 {n} 章 · {}",
+                Self::vendor_label(&self.settings.review_vendor)
+            ),
+        );
+    }
     /// 替换原文成功后链式触发的「状态档案同步」：
     /// 让审计 LLM 基于（旧正文/新正文/状态档案/最近审计）输出 JSON 差异，再写回 `story_state/*.md`。
     fn start_state_sync(&mut self, n: i32, old_body: &str, new_body: &str) {
@@ -5305,12 +6054,16 @@ impl InkOsApp {
             return;
         }
         let state_docs = self.collect_state_docs_for_prompt(3000);
-        let (summaries, novel_brief, goal, tol) = {
+        let (summaries, novel_brief, goal, tol, last_chapter_end) = {
             let Some(project) = self.project.as_ref() else { return };
             let Some(store) = self.store.as_ref() else { return };
             let summaries = store.build_chapter_summaries_document(project);
             let goal = project.chapter_word_goal.max(0);
             let tol = self.settings.effective_word_tolerance();
+            let extra = inkoswin_prompt::substitute_prompt_vars(
+                project.extra_guidance.trim(),
+                &store.resolve_last_chapter_end(project, next_n),
+            );
             let novel_brief = format!(
                 "书名：{}\n题材：{}\n字数目标：约 {} 字/章\n核心：{}\n主角：{}\n世界：{}\n文风：{}\n大纲：{}\n额外提示：{}",
                 project.title.trim(),
@@ -5321,9 +6074,31 @@ impl InkOsApp {
                 project.world_setting.trim(),
                 project.writing_style.trim(),
                 project.outline.trim(),
-                project.extra_guidance.trim(),
+                extra,
             );
-            (summaries, novel_brief, goal, tol)
+            let last_chapter_end = store.resolve_last_chapter_end(project, next_n);
+            (summaries, novel_brief, goal, tol, last_chapter_end)
+        };
+        let (seam_block, seam_rule) =
+            inkoswin_prompt::chapter_seam_markdown_sections(&last_chapter_end);
+        let pending_hooks_section = if next_n >= 2 {
+            let mut docs = std::collections::HashMap::new();
+            if let Some(store) = self.store.as_ref() {
+                let path = store.state_dir().join("pending_hooks.md");
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    if !text.trim().is_empty() {
+                        docs.insert("pending_hooks.md".to_string(), text);
+                    }
+                }
+            }
+            inkoswin_prompt::pending_hooks_focus_section(next_n, &docs)
+        } else {
+            String::new()
+        };
+        let chapter1_json_section = if next_n <= 1 {
+            inkoswin_prompt::chapter1_hooks_json_output_section().to_string()
+        } else {
+            String::new()
         };
         let audit_block = if self.auto_gen_audit_text.trim().is_empty() {
             "（无）".to_string()
@@ -5331,17 +6106,22 @@ impl InkOsApp {
             self.auto_gen_audit_text.trim().to_string()
         };
 
-        let messages = vec![
-            ChatMessage::system(
-                "你是一位中文长篇小说作者。请按用户提供的设定、状态档案、历史摘要与上一章审计意见，撰写下一章的完整正文：\n\
+        let auto_gen_system = if next_n <= 1 {
+            "你是一位中文长篇小说作者。请创作开篇第一章：慢节奏铺陈、重氛围与感官细节，以悬念与锚点为主。\
+输出为 Markdown（`# 章节标题` + 正文）；正文结束后可追加一个闭合的 ```json 代码围栏同步 pending_hooks.md，除此之外不要解释。"
+        } else {
+            "你是一位中文长篇小说作者。请按用户提供的设定、状态档案、历史摘要与上一章审计意见，撰写下一章的完整正文：\n\
                  - 输出格式必须是 Markdown，第一行为 `# 章节标题`，后跟正文；\n\
                  - 不要输出任何解释或元信息；\n\
-                 - 保持节奏紧凑，画面感强；\n\
+                 - 慢节奏铺陈、重氛围与感官细节，严禁剧情连跳与空间跳跃；\n\
                  - 严格遵循审计意见中的「必须修复点」与「应延续的悬念」；\n\
-                 - 与状态档案、已埋伏笔严格保持一致。",
-            ),
+                 - 与状态档案、已埋伏笔严格保持一致。"
+        };
+        let messages = vec![
+            ChatMessage::system(auto_gen_system),
             ChatMessage::user(format!(
-                "## 小说设定\n{novel_brief}\n\n## 状态档案\n{state_docs_block}\n\n## 历史章节摘要\n{summaries}\n\n## 上一章审计要点\n{audit_block}\n\n## 字数硬约束\n本章正文必须落在 [{min_words}, {max_words}] 字区间，偏差不得超过容差，禁止用无意义段落凑字数。\n\n请创作【第 {next_n} 章】。",
+                "## 小说设定\n{novel_brief}\n\n## 状态档案\n{state_docs_block}\n\n## 历史章节摘要\n{summaries}\n\n{atmosphere_styling}{pending_hooks_section}{seam_block}{seam_rule}{chapter1_json_section}## 上一章审计要点\n{audit_block}\n\n## 字数硬约束\n本章正文必须落在 [{min_words}, {max_words}] 字区间，偏差不得超过容差，禁止用无意义段落凑字数。\n\n请创作【第 {next_n} 章】。",
+                atmosphere_styling = inkoswin_prompt::chapter_dynamic_markdown_section(next_n),
                 state_docs_block = if state_docs.is_empty() { "（无）".to_string() } else { state_docs },
                 min_words = (goal - tol).max(0),
                 max_words = goal + tol,
@@ -5411,6 +6191,7 @@ impl InkOsApp {
                 created_at: crate::project::now_iso(),
                 updated_at: crate::project::now_iso(),
                 beats: Vec::new(),
+                end_snapshot: String::new(),
             });
 
         // previous_materials：target 之前、正文非空的章节，按 number 升序（节拍只需摘要，但 prompt
@@ -5567,6 +6348,7 @@ impl InkOsApp {
                 created_at: crate::project::now_iso(),
                 updated_at: crate::project::now_iso(),
                 beats: self.chapter_beats.clone(),
+                end_snapshot: String::new(),
             });
 
         // 2. previous_materials：target 之前、正文非空的章节，按 number 升序。
@@ -5607,7 +6389,10 @@ impl InkOsApp {
         let filtered_state_docs =
             crate::state_refresh::filter_state_docs_by_beats(&state_docs, &beats);
 
-        // 6. 构造主体 prompt（inkoswin 原版 + Beats 注入）
+        let last_chapter_end =
+            store.resolve_last_chapter_end(&project_snapshot, target_n);
+
+        // 6. 构造主体 prompt（inkoswin 原版 + Beats 注入 + 上一章末尾衔接）
         let (system_prompt, mut user_prompt) = inkoswin_prompt::build_generation_prompts(
             &project_snapshot,
             &target_chapter,
@@ -5615,6 +6400,7 @@ impl InkOsApp {
             &beats,
             &current_draft,
             &filtered_state_docs,
+            &last_chapter_end,
         );
 
         // 6. 桌面端扩展（可选增强，不影响核心对齐）：story 控制层 + 上一章审计 + 字数治理提醒
@@ -5779,6 +6565,114 @@ impl InkOsApp {
         );
     }
 
+    /// 第一章正文生成完成后：若正文尾部未带可解析的悬念 JSON，则启动独立悬念审计子任务。
+    fn start_hooks_extraction_subtask(&mut self, chapter_title: &str, chapter_body: &str) {
+        if self.hooks_extract_task.is_some() {
+            return;
+        }
+        if chapter_body.trim().is_empty() {
+            return;
+        }
+        let vendor_id = self.settings.writing_vendor.clone();
+        if vendor_id.is_empty() {
+            return;
+        }
+        let Some(cfg) = self.vendor_config(&vendor_id) else {
+            return;
+        };
+        if !cfg.is_configured() {
+            return;
+        }
+        let genre = self
+            .project
+            .as_ref()
+            .map(|p| p.genre.clone())
+            .unwrap_or_default();
+        let (system_prompt, user_prompt) = inkoswin_prompt::build_audit_hooks_prompts(
+            chapter_title,
+            chapter_body,
+            &genre,
+        );
+        let messages = vec![
+            ChatMessage::system(&system_prompt),
+            ChatMessage::user(user_prompt),
+        ];
+        let model = cfg.model.clone();
+        self.hooks_extract_task = Some(spawn_chat(cfg, vendor_id, model, messages, false));
+        self.status_message = "第 1 章已生成；正在提取悬念钩子…".into();
+        oplog::try_append(
+            self.novel_path.as_deref(),
+            "AI 悬念提取 · 开始",
+            chapter_title,
+        );
+    }
+
+    fn handle_hooks_extract_done(&mut self) {
+        let Some(task) = self.hooks_extract_task.take() else {
+            return;
+        };
+        if let Some(err) = task.error.clone() {
+            self.status_message = format!("悬念提取失败：{err}");
+            oplog::try_append(
+                self.novel_path.as_deref(),
+                "AI 悬念提取 · 失败",
+                &err,
+            );
+            return;
+        }
+        let raw = task.accumulated.trim();
+        if raw.is_empty() {
+            self.status_message = "悬念提取结果为空".into();
+            return;
+        }
+        match inkoswin_prompt::parse_audit_hooks_output(raw) {
+            Ok(report) => {
+                let count = report.hooks.len();
+                if count == 0 {
+                    self.status_message = "悬念提取完成，但未识别到有效钩子".into();
+                    return;
+                }
+                if let (Some(root), Some(store)) = (&self.novel_path, &self.store) {
+                    match state_sync::apply_audit_hooks_report(
+                        &report,
+                        root,
+                        &store.state_dir(),
+                    ) {
+                        Ok(Some(_res)) => {
+                            self.refresh_pending_hooks();
+                            self.status_message =
+                                format!("已提取并同步 {count} 条悬念至 pending_hooks.md");
+                            oplog::try_append(
+                                self.novel_path.as_deref(),
+                                "AI 悬念提取 · 完成",
+                                &format!("{count} 条钩子"),
+                            );
+                        }
+                        Ok(None) => {
+                            self.status_message = "悬念提取完成，但未能写入档案".into();
+                        }
+                        Err(e) => {
+                            self.status_message = format!("悬念写入 pending_hooks 失败：{e}");
+                            oplog::try_append(
+                                self.novel_path.as_deref(),
+                                "AI 悬念提取 · 落盘失败",
+                                &e.to_string(),
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                self.status_message = format!("悬念 JSON 解析失败：{e}");
+                oplog::try_append(
+                    self.novel_path.as_deref(),
+                    "AI 悬念提取 · 解析失败",
+                    &e.to_string(),
+                );
+            }
+        }
+    }
+
     fn handle_manual_gen_done(&mut self) {
         let Some(task) = self.manual_gen_task.take() else { return };
         let target_n = self.manual_gen_target.take().unwrap_or(0);
@@ -5802,8 +6696,49 @@ impl InkOsApp {
         };
         let result = inkoswin_prompt::parse_generation_output(&raw, &fallback_title);
 
-        self.chapter_title = result.title;
-        self.chapter_body = result.content;
+        let mut hooks_sync_note = String::new();
+        let mut inline_hooks_applied = false;
+        if target_n <= 1 {
+            if let (Some(root), Some(store)) = (&self.novel_path, &self.store) {
+                match state_sync::apply_prologue_pending_hooks_from_raw(
+                    &raw,
+                    root,
+                    &store.state_dir(),
+                ) {
+                    Ok(Some(res)) => {
+                        inline_hooks_applied = true;
+                        self.refresh_pending_hooks();
+                        hooks_sync_note = format!(
+                            "；已同步 {} 条悬念至 pending_hooks.md",
+                            res.updates_applied
+                        );
+                        if !res.summary.trim().is_empty() {
+                            hooks_sync_note.push_str(&format!("（{}）", res.summary.trim()));
+                        }
+                        oplog::try_append(
+                            self.novel_path.as_deref(),
+                            "AI 生成本章 · 悬念同步",
+                            &format!(
+                                "第 {target_n} 章 · {} 条 · {}",
+                                res.updates_applied,
+                                res.summary.trim()
+                            ),
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        oplog::try_append(
+                            self.novel_path.as_deref(),
+                            "AI 生成本章 · 悬念同步失败",
+                            &e.to_string(),
+                        );
+                    }
+                }
+            }
+        }
+
+        self.chapter_title = result.title.clone();
+        self.chapter_body = result.content.clone();
         // 摘要：若 LLM 给出，则写入摘要编辑框并标记为 dirty 供用户一并保存；
         // 否则保留原摘要（parse_generation_output 已在 fallback 场景自动生成 make_summary）。
         let normalized_summary = self.normalize_generated_summary(&result.summary, &self.chapter_body);
@@ -5819,7 +6754,7 @@ impl InkOsApp {
         self.pending_book_rules_sync_on_save = target_n == 1;
         let words = self.chapter_body.chars().filter(|c| !c.is_whitespace()).count();
         self.status_message = format!(
-            "✓ 第 {target_n} 章已生成（{words} 字 · {:.1}s），请核对后保存",
+            "✓ 第 {target_n} 章已生成（{words} 字 · {:.1}s{hooks_sync_note}），请核对后保存",
             task.elapsed_secs()
         );
         let body_for_govern = self.chapter_body.clone();
@@ -5829,6 +6764,10 @@ impl InkOsApp {
             "AI 生成本章 · 完成",
             &format!("第 {target_n} 章 · {words} 字"),
         );
+
+        if target_n <= 1 && !inline_hooks_applied {
+            self.start_hooks_extraction_subtask(&result.title, &result.content);
+        }
     }
 
     /// 「AI 生成 book_rules.md」（对齐 `Narcooo/inkos` `architect.bookRulesPrompt`）。
@@ -6069,6 +7008,43 @@ impl InkOsApp {
                 }
                 // 与「生成本章」对齐：优先解析 标题/摘要/正文 三段；
                 // 若模型未给摘要，则 parse_generation_output 会回退生成摘要。
+                let mut inline_hooks_applied = false;
+                if n <= 1 {
+                    if let (Some(root), Some(store)) = (&self.novel_path, &self.store) {
+                        match state_sync::apply_prologue_pending_hooks_from_raw(
+                            &raw,
+                            root,
+                            &store.state_dir(),
+                        ) {
+                            Ok(Some(res)) => {
+                                inline_hooks_applied = true;
+                                self.refresh_pending_hooks();
+                                self.auto_gen_log.push(format!(
+                                    "{}  已同步 {} 条悬念至 pending_hooks.md",
+                                    short_time(),
+                                    res.updates_applied
+                                ));
+                                oplog::try_append(
+                                    self.novel_path.as_deref(),
+                                    "定时写作 · 悬念同步",
+                                    &format!(
+                                        "第 {n} 章 · {} 条 · {}",
+                                        res.updates_applied,
+                                        res.summary.trim()
+                                    ),
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                self.auto_gen_log.push(format!(
+                                    "{}  悬念同步失败：{e}",
+                                    short_time()
+                                ));
+                            }
+                        }
+                    }
+                }
+
                 let fallback_title = format!("第{n}章");
                 let result = inkoswin_prompt::parse_generation_output(&raw, &fallback_title);
                 let title = if result.title.trim().is_empty() {
@@ -6079,6 +7055,9 @@ impl InkOsApp {
                 let body = result.content;
                 let summary = self.normalize_generated_summary(&result.summary, &body);
                 let novel_root = self.novel_path.clone();
+                let need_hooks_extract = n <= 1 && !inline_hooks_applied;
+                let hooks_title = title.clone();
+                let hooks_body = body.clone();
                 let (Some(store), Some(project)) = (&self.store, &mut self.project) else { return };
                 let cur_beats = project
                     .chapters
@@ -6136,6 +7115,9 @@ impl InkOsApp {
                         };
                         let _ = crate::notify::notify_all(&self.settings.notify, &evt);
                     }
+                }
+                if need_hooks_extract {
+                    self.start_hooks_extraction_subtask(&hooks_title, &hooks_body);
                 }
                 self.auto_gen_audit_text.clear();
             }

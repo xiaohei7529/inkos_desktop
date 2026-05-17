@@ -146,6 +146,10 @@ pub fn build_draft_prompt(
     word_goal: i32,
     word_tolerance: i32,
 ) -> String {
+    let last_chapter_end = store.resolve_last_chapter_end(project, chapter_no);
+    let (seam_block, seam_rule) =
+        crate::inkoswin_prompt::chapter_seam_markdown_sections(&last_chapter_end);
+
     let mut out = String::new();
     out.push_str("## 任务\n");
     out.push_str(&format!(
@@ -155,6 +159,33 @@ pub fn build_draft_prompt(
     out.push_str(&format!(
         "目标字数：{word_goal} 字，允许波动 ±{word_tolerance} 字。\n请以第三人称限知/全知视角写作，遵守文风指纹与 governance 块。\n\n",
     ));
+    out.push_str(&seam_block);
+    out.push_str(&seam_rule);
+    out.push_str(&crate::inkoswin_prompt::chapter_dynamic_markdown_section(chapter_no));
+    if chapter_no >= 2 {
+        let mut docs = std::collections::HashMap::new();
+        for f in [
+            "pending_hooks.md",
+            "outline.md",
+            "novel_brief.md",
+            "current_state.md",
+            "book_rules.md",
+        ] {
+            let path = store.state_dir().join(f);
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if !text.trim().is_empty() {
+                    docs.insert(f.to_string(), text);
+                }
+            }
+        }
+        out.push_str(&crate::inkoswin_prompt::pending_hooks_focus_section(
+            chapter_no,
+            &docs,
+        ));
+    }
+    if chapter_no <= 1 {
+        out.push_str(crate::inkoswin_prompt::chapter1_hooks_json_output_section());
+    }
 
     out.push_str("## 章节意图卡\n");
     out.push_str(intent_md);

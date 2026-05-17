@@ -212,6 +212,59 @@ pub fn spawn_chat(
     }
 }
 
+/// 新建小说向导「AI 灵感生成」：与 `spawn_chat` 相同返回 `LlmTask`，内部在独立线程中
+/// 创建 Tokio runtime，使用 `tokio::spawn` + `spawn_blocking` 执行同步 `call_chat`（非流式）。
+pub fn spawn_generate_init_settings(
+    cfg: VendorConfig,
+    vendor_id: String,
+    model: String,
+    messages: Vec<ChatMessage>,
+) -> LlmTask {
+    let (tx, rx) = mpsc::channel();
+    let v_id = vendor_id.clone();
+    let m_id = model.clone();
+    thread::spawn(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = tx.send(LlmEvent::Error(format!("无法创建异步运行时：{e}")));
+                return;
+            }
+        };
+        rt.block_on(async move {
+            let send_err = tx.clone();
+            let handle = tokio::spawn(async move {
+                match tokio::task::spawn_blocking(move || call_chat(&cfg, &model, &messages)).await {
+                    Ok(Ok(content)) => {
+                        let _ = send_err.send(LlmEvent::Delta(content));
+                        let _ = send_err.send(LlmEvent::Done);
+                    }
+                    Ok(Err(e)) => {
+                        let _ = send_err.send(LlmEvent::Error(e));
+                    }
+                    Err(e) => {
+                        let _ = send_err.send(LlmEvent::Error(format!("blocking 任务异常：{e}")));
+                    }
+                }
+            });
+            if let Err(e) = handle.await {
+                let _ = tx.send(LlmEvent::Error(format!("任务未正常结束：{e}")));
+            }
+        });
+    });
+    LlmTask {
+        rx,
+        accumulated: String::new(),
+        done: false,
+        error: None,
+        vendor_id: v_id,
+        model: m_id,
+        streaming: false,
+        started_at: Instant::now(),
+        elapsed_when_done: None,
+    }
+}
+
 /// 测试连接：发送最小 chat 请求验证 base_url + api_key + model 是否可用。
 pub fn spawn_ping(cfg: VendorConfig, model: String) -> LlmTask {
     let messages = vec![ChatMessage::user("请回复一个字 ok。")];

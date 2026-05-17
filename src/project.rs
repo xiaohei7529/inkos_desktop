@@ -53,6 +53,28 @@ pub struct ChapterRecord {
     /// 通过 `#[serde(default)]` 兼容旧的 `project.json`（缺字段时为空 `Vec`）。
     #[serde(default)]
     pub beats: Vec<String>,
+    /// 本章正文末尾快照（最多 500 字），供下一章衔接；保存章节时自动更新。
+    #[serde(default)]
+    pub end_snapshot: String,
+}
+
+/// 章节末尾快照最大字数（按 Unicode 字符计）。
+pub const CHAPTER_END_SNAPSHOT_CHARS: usize = 500;
+
+/// 取正文末尾最多 [`CHAPTER_END_SNAPSHOT_CHARS`] 字，供章间衔接。
+pub fn chapter_tail_snapshot(content: &str) -> String {
+    let stripped = content.trim();
+    let count = stripped.chars().count();
+    if count == 0 {
+        return String::new();
+    }
+    if count <= CHAPTER_END_SNAPSHOT_CHARS {
+        return stripped.to_string();
+    }
+    stripped
+        .chars()
+        .skip(count - CHAPTER_END_SNAPSHOT_CHARS)
+        .collect()
 }
 
 fn default_status() -> String {
@@ -186,6 +208,27 @@ impl ProjectStore {
         project.chapters.iter().find(|c| c.number == number)
     }
 
+    /// 写作第 `target_n` 章时，解析上一章末尾衔接点（优先 `end_snapshot`，否则从正文计算）。
+    pub fn resolve_last_chapter_end(
+        &self,
+        project: &NovelProject,
+        target_n: i32,
+    ) -> String {
+        if target_n <= 1 {
+            return String::new();
+        }
+        let prev_n = target_n - 1;
+        if let Some(ch) = Self::get_chapter(project, prev_n) {
+            if !ch.end_snapshot.trim().is_empty() {
+                return ch.end_snapshot.clone();
+            }
+        }
+        let (_t, body) = self
+            .load_chapter_content(prev_n)
+            .unwrap_or((String::new(), String::new()));
+        chapter_tail_snapshot(&body)
+    }
+
     pub fn ensure_chapter(&self, project: &mut NovelProject, number: i32, title: &str) -> Result<usize> {
         if let Some(i) = project.chapters.iter().position(|c| c.number == number) {
             if !title.trim().is_empty() && project.chapters[i].title.trim().is_empty() {
@@ -208,6 +251,7 @@ impl ProjectStore {
             created_at: now.clone(),
             updated_at: now,
             beats: Vec::new(),
+            end_snapshot: String::new(),
         });
         project.chapters.sort_by_key(|c| c.number);
         self.save_project(project)?;
@@ -285,6 +329,7 @@ impl ProjectStore {
             .map(|b| b.trim().to_string())
             .filter(|b| !b.is_empty())
             .collect();
+        chapter.end_snapshot = chapter_tail_snapshot(clean_content);
 
         self.save_project(project)?;
         Ok(())
@@ -507,6 +552,7 @@ impl ProjectStore {
                     created_at: mtime.clone(),
                     updated_at: mtime,
                     beats: Vec::new(),
+                    end_snapshot: chapter_tail_snapshot(&c),
                 });
                 known.insert(num);
             }
@@ -528,6 +574,9 @@ impl ProjectStore {
             chapter.word_count = count_story_units(&c) as i32;
             if chapter.summary.trim().is_empty() {
                 chapter.summary = make_summary(&c, DEFAULT_CHAPTER_SUMMARY_LIMIT);
+            }
+            if chapter.end_snapshot.trim().is_empty() && !c.trim().is_empty() {
+                chapter.end_snapshot = chapter_tail_snapshot(&c);
             }
             chapter.updated_at = mtime_iso(&path).unwrap_or_else(now_iso);
         }
@@ -749,6 +798,68 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("已有小说档案"));
+    }
+
+    #[test]
+    fn chapter_tail_snapshot_empty() {
+        assert_eq!(chapter_tail_snapshot(""), "");
+        assert_eq!(chapter_tail_snapshot("   \n\t"), "");
+    }
+
+    #[test]
+    fn chapter_tail_snapshot_short_and_long() {
+        let short = "短正文";
+        assert_eq!(chapter_tail_snapshot(short), short);
+        let long: String = (0..600).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+        let tail = chapter_tail_snapshot(&long);
+        assert_eq!(tail.chars().count(), CHAPTER_END_SNAPSHOT_CHARS);
+        assert!(long.ends_with(&tail));
+    }
+
+    #[test]
+    fn chapter_tail_snapshot_utf8() {
+        let s = "一二三四五六七八九十".repeat(60); // 600 chars
+        let tail = chapter_tail_snapshot(&s);
+        assert_eq!(tail.chars().count(), CHAPTER_END_SNAPSHOT_CHARS);
+        assert!(s.ends_with(&tail));
+    }
+
+    #[test]
+    fn resolve_last_chapter_end_first_chapter_empty() {
+        let dir = temp_project_dir("resolve_empty");
+        fs::create_dir_all(&dir).unwrap();
+        let store = ProjectStore::new(dir.clone());
+        let project = store.load_project().unwrap();
+        assert_eq!(store.resolve_last_chapter_end(&project, 1), "");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_last_chapter_end_from_snapshot() {
+        let dir = temp_project_dir("resolve_snap");
+        fs::create_dir_all(dir.join(".inkoswin")).unwrap();
+        fs::create_dir_all(dir.join("chapters")).unwrap();
+        let mut project = NovelProject::default();
+        project.chapters.push(ChapterRecord {
+            number: 1,
+            title: "第一章".into(),
+            summary: String::new(),
+            status: "generated".into(),
+            word_count: 10,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            beats: Vec::new(),
+            end_snapshot: "上一章末尾片段".into(),
+        });
+        let json = serde_json::to_string_pretty(&project).unwrap();
+        fs::write(dir.join(".inkoswin").join("project.json"), json).unwrap();
+        let store = ProjectStore::new(dir.clone());
+        let project = store.load_project().unwrap();
+        assert_eq!(
+            store.resolve_last_chapter_end(&project, 2),
+            "上一章末尾片段"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

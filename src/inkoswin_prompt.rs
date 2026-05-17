@@ -10,6 +10,10 @@
 //! - 输出格式：`标题：/摘要：/正文：`
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 use crate::chapter_md::{make_summary, DEFAULT_CHAPTER_SUMMARY_LIMIT};
 use crate::project::{ChapterRecord, NovelProject};
@@ -95,6 +99,311 @@ fn build_state_context_text(state_documents: &HashMap<String, String>) -> String
     }
 }
 
+/// 通用慢节奏、重氛围写作指导（全章节基础层）。
+pub const COMMON_WRITING_GUIDE: &str = r#"
+### 核心创作指令：慢节奏与重氛围 (Slow Burn & Atmosphere)
+
+1. **叙事比重控制 (Pacing Ratio)**：
+   - 严禁连续推进剧情。每发生一个动作（如：推门），必须配合至少 3 句以上的环境描写或内心独白。
+   - 剧情推进速度调慢 3 倍：第一章原本要写的“吃药”，请拆解为“观察药丸的纹理”、“闻到的古怪气味”、“指尖的颤抖”、“吞咽时的冰冷感”以及“药效在血管里散开的视觉异象”。
+
+2. **感官沉浸 (Sensory Detail - Show, Don't Tell)**：
+   - **视觉**：不要只说“雾大”，要说“路灯的光被浓雾撕碎，像溺水者的残喘”。
+   - **触觉/体感**：强调左眼刺痛的层次感——从针扎到火烧，再到冰冷的黏稠感爬上视神经。
+   - **听觉**：放大死寂中的噪音，如“停尸房冷柜压缩机的震动声在耳膜里激起阵阵嗡鸣”。
+
+3. **心理写实 (Psychological Depth)**：
+   - 增加林夜作为“阴阳眼值班员”的职业疲惫感与对未知的恐惧。
+   - 他对苏清婉的信任不应该是瞬间产生的，必须有审视、怀疑和本能的防备描写。
+
+4. **零跳跃衔接 (Seamless Transition)**：
+   - 严禁出现“推开门后我来到了街上”这种空间跳跃。
+   - 必须写出移动的过程：如何穿过走廊，推开沉重的铁门，冷风如何灌进领口，街上雾气的浓度对比，以及左眼在不同光线下的反应变化。
+"#;
+
+/// 与 [`COMMON_WRITING_GUIDE`] 同义，保留旧名兼容。
+pub const ATMOSPHERE_STYLING: &str = COMMON_WRITING_GUIDE;
+
+/// 第一章专属：悬念与锚点（与 [`CHAPTER_ONE_STRATEGY`] 互补，保留 JSON 输出提醒）。
+pub const PROLOGUE_SENSE_GUIDE: &str = r#"
+### 第一章专属创作指令：悬念与锚点
+
+1. **叙事压制 (Information Suppression)**：
+   - 严禁在第一章解释世界观底层逻辑、超能力来源或反派最终目的。
+   - 遵循“只给谜面，不给谜底”原则。如果主角发现了异样，第一章只描写异样的恐怖/怪异，不许描写“为什么会这样”。
+
+2. **悬念捕捉 (Hook Extraction)**：
+   - 在本章结束时，你必须识别出本章埋下的、尚未解决的 3-5 个悬念（Hooks）。
+   - 每条悬念须能对应：[悬念名称]、[线索片段]、[潜在指向]。
+
+3. **感官描写入门**：
+   - 强制使用“局部特写”代替“全景叙述”。不要写“我来到了殡仪馆”，要写“脚下老旧的木地板发出的嘎吱声，在浓雾中传得很远，仿佛有什么东西在暗处数着我的步子”。
+
+4. **输出格式限制**：
+   - 正文（标题/摘要/正文）结束后，可追加闭合的 ```json 代码围栏同步 pending_hooks（详见输出格式第 5 条）；程序亦会在写完后自动审计提取悬念。
+"#;
+
+/// 第一章特化：反大纲化与悬念构建（通用题材，不限诡异/都市/言情）。
+pub const CHAPTER_ONE_STRATEGY: &str = r#"
+### 第一章特化创作指南：反大纲化与悬念构建
+
+1. **信息遮蔽原则 (Information Shadowing)**：
+   - 严禁在第一章解释世界观的全貌。
+   - 所有的设定必须通过“异常现象”引出，而不是通过“内心独白”解释。
+   - 示例：不要写“这是一个邪神入侵的世界”，要写“街角的雕像在林夜转头时，似乎裂开了一道缝，溢出了腐臭的粘液”。
+
+2. **微观张力 (Micro-Tension)**：
+   - 每 300 字必须出现一个“不确定性”。不要让主角顺利完成动作。
+   - 即使是喝咖啡，也要描写“咖啡表面的倒影扭曲成了一张陌生的脸”，通过这种不间断的微小干扰防止剧情平铺直叙。
+
+3. **留白与钩子 (The Hook Extraction)**：
+   - 在本章结尾，请埋下可被后续回收的【悬念钩子】。
+   - 每个钩子必须包含：一个未被解释的动作、一个语焉不详的道具、或者一个身份不明的角色。
+
+4. **拒绝逻辑闭环**：
+   - 第一章的任务不是“解决问题”，而是“展示危机”。
+   - 结尾必须停留在一个“不得不进行下一步”的紧迫点上，且该点必须产生至少两个逻辑方向的未知。
+"#;
+
+/// 第 2 章起：强制推进已有伏笔，禁止只挖坑不填坑。
+pub const CONTINUITY_HOOKS_GUIDE: &str = r#"
+### 连贯性要求：待回收伏笔（必读）
+
+- 你必须将上方 [待回收伏笔（必须推进）] 与 [连续性档案] 中的 pending_hooks.md 视为**必读背景**。
+- 每一章必须从中挑选 1-2 个现有钩子进行「推进」或「加深谜团」，严禁只挖坑不填坑、严禁抛弃已有悬念开启无关新线。
+- 请根据前章末尾的物理状态与 pending_hooks 中的线索进行衔接，禁止空间/时间跳跃。
+"#;
+
+/// 悬念审计 JSON 单条（通用题材：玄幻戒指老头 / 都市神秘短信 / 言情消失初恋等）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditHookEntry {
+    pub source: String,
+    #[serde(rename = "type")]
+    pub hook_type: String,
+    pub status: String,
+    pub urgency: i32,
+}
+
+/// 悬念审计 LLM 输出根结构。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AuditHooksReport {
+    #[serde(default)]
+    pub hooks: Vec<AuditHookEntry>,
+}
+
+/// 构造「第一章正文 → 悬念钩子提取」的 (system, user) prompt（独立子任务，非阻塞主写作流）。
+pub fn build_audit_hooks_prompts(
+    chapter_title: &str,
+    chapter_body: &str,
+    genre: &str,
+) -> (String, String) {
+    let body = trim_text(chapter_body.trim(), 12_000);
+    let genre_label = if genre.trim().is_empty() {
+        "通用长篇小说"
+    } else {
+        genre.trim()
+    };
+    let system_prompt = "你是一名长篇小说 continuity 编辑，专责从章节正文中提取尚未解答的谜团、伏笔与潜在冲突。\
+不要改写正文，不要输出 Markdown 说明，只输出一个 JSON 对象（可用 ```json 围栏包裹）。".to_string();
+    let user_prompt = format!(
+        "请阅读以下「{genre_label}」题材、第 1 章正文，提取 3-5 条【悬念钩子】。\n\n\
+         章节标题：{chapter_title}\n\n\
+         ## 正文\n{body}\n\n\
+         ## 输出要求\n\
+         严格输出如下 JSON Schema（字段名不可改）：\n\
+         {{\n\
+           \"hooks\": [\n\
+             {{\n\
+               \"source\": \"原文中的具体细节/句子摘要\",\n\
+               \"type\": \"人物身份 | 世界秘密 | 关键道具 | 情感矛盾（择一或组合）\",\n\
+               \"status\": \"active\",\n\
+               \"urgency\": 1-5 的整数\n\
+             }}\n\
+           ]\n\
+         }}\n\n\
+         - 无论玄幻、都市、言情或悬疑，凡未解释的现象、道具、人物身份矛盾都必须收录。\n\
+         - urgency：5 为最紧迫、1 为可延后。\n\
+         - hooks 数组至少 1 条，建议 3-5 条。"
+    );
+    (system_prompt, user_prompt)
+}
+
+/// 解析悬念审计 LLM 回包。
+pub fn parse_audit_hooks_output(raw: &str) -> anyhow::Result<AuditHooksReport> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("悬念审计返回为空");
+    }
+    if let Ok(r) = serde_json::from_str::<AuditHooksReport>(trimmed) {
+        return Ok(r);
+    }
+    if let Some(body) = crate::state_sync::trailing_json_fence_body(trimmed) {
+        if let Ok(r) = serde_json::from_str::<AuditHooksReport>(body) {
+            return Ok(r);
+        }
+    }
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if end >= start {
+            let slice = &trimmed[start..=end];
+            if let Ok(r) = serde_json::from_str::<AuditHooksReport>(slice) {
+                return Ok(r);
+            }
+        }
+    }
+    anyhow::bail!("无法解析为 AuditHooksReport JSON")
+}
+
+/// 将审计结果格式化为 `pending_hooks.md` 增量条目（供 patch 追加）。
+pub fn hooks_report_to_pending_hooks_markdown(report: &AuditHooksReport) -> String {
+    let mut blocks: Vec<String> = Vec::new();
+    for (i, h) in report.hooks.iter().enumerate() {
+        if h.source.trim().is_empty() {
+            continue;
+        }
+        let name = {
+            let t = h.hook_type.trim();
+            if t.is_empty() {
+                format!("悬念{}", i + 1)
+            } else {
+                t.to_string()
+            }
+        };
+        let urgency = h.urgency.clamp(1, 5);
+        let status = if h.status.trim().is_empty() {
+            "active".to_string()
+        } else {
+            h.status.trim().to_string()
+        };
+        let pointing = format!(
+            "类型：{}；状态：{}；紧迫度 {urgency}/5（供作者/后续章节参考，勿在正文中提前揭晓答案）",
+            h.hook_type.trim(),
+            status
+        );
+        blocks.push(format!(
+            "### [{name}]\n- [线索片段]：{}\n- [潜在指向]：{pointing}\n",
+            h.source.trim()
+        ));
+    }
+    if blocks.is_empty() {
+        return String::new();
+    }
+    blocks.join("\n")
+}
+
+const PENDING_HOOKS_FOCUS_LIMIT: usize = 2000;
+
+/// 按章节号动态组合通用指导 + 开篇/连贯性层。
+pub fn get_chapter_dynamic_prompt(chapter_num: i32) -> String {
+    let common = COMMON_WRITING_GUIDE.trim();
+    if chapter_num <= 1 {
+        format!(
+            "{common}\n\n{}\n\n{}",
+            CHAPTER_ONE_STRATEGY.trim(),
+            PROLOGUE_SENSE_GUIDE.trim()
+        )
+    } else {
+        format!("{common}\n\n{}", CONTINUITY_HOOKS_GUIDE.trim())
+    }
+}
+
+/// inkoswin 章节生成 user prompt 段（方括号标题）。
+pub fn chapter_dynamic_bracket_section(chapter_num: i32) -> String {
+    format!(
+        "[写作指导]\n{}\n\n",
+        get_chapter_dynamic_prompt(chapter_num)
+    )
+}
+
+/// Markdown 段（定时写作 / 写作管线 Draft 等同构注入）。
+pub fn chapter_dynamic_markdown_section(chapter_num: i32) -> String {
+    format!(
+        "## 写作指导\n{}\n\n",
+        get_chapter_dynamic_prompt(chapter_num)
+    )
+}
+
+/// 兼容旧调用：默认按第 2 章逻辑（含连贯性伏笔要求）。
+pub fn atmosphere_styling_bracket_section() -> String {
+    chapter_dynamic_bracket_section(2)
+}
+
+/// 兼容旧调用：默认按第 2 章逻辑。
+pub fn atmosphere_styling_markdown_section() -> String {
+    chapter_dynamic_markdown_section(2)
+}
+
+/// 第 2 章起：单独放大 pending_hooks.md，避免在连续性档案中被截断。
+pub fn pending_hooks_focus_section(
+    chapter_num: i32,
+    state_documents: &HashMap<String, String>,
+) -> String {
+    if chapter_num < 2 {
+        return String::new();
+    }
+    let excerpt = state_documents
+        .get("pending_hooks.md")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| trim_text(s, PENDING_HOOKS_FOCUS_LIMIT))
+        .unwrap_or_else(|| "（暂无，但仍须承接前文已埋伏笔）".to_string());
+    format!("[待回收伏笔（必须推进）]\n{excerpt}\n\n")
+}
+
+/// 第一章专属：正文后的 pending_hooks JSON 输出说明。
+pub fn chapter1_hooks_json_output_section() -> &'static str {
+    r#"         5. 第一章额外要求：正文结束后必须追加闭合的 ```json 代码围栏（仅此一处机器块），用于更新 pending_hooks.md。Schema 必须为单个 JSON 对象：
+         {
+           "summary": "本章悬念提取一句话摘要",
+           "updates": [
+             {
+               "file": "pending_hooks.md",
+               "action": "patch",
+               "content": "（Markdown：每条悬念含 [悬念描述]、[关联线索]、[预期威胁]；可用 ===REPLACE_BLOCK=== 将新条目追加到「核心伏笔」区）"
+             }
+           ]
+         }
+         - updates 中仅允许 file 为 pending_hooks.md；action 优先 patch。
+         - JSON 围栏之前必须是完整的 标题/摘要/正文，不要在正文中夹杂 JSON。
+"#
+}
+
+/// Prompt 模板变量名：`{{LAST_CHAPTER_END}}`。
+pub const PROMPT_VAR_LAST_CHAPTER_END: &str = "LAST_CHAPTER_END";
+
+/// 将 `{{LAST_CHAPTER_END}}` 替换为上一章末尾衔接文本。
+pub fn substitute_prompt_vars(text: &str, last_chapter_end: &str) -> String {
+    text.replace(
+        &format!("{{{{{PROMPT_VAR_LAST_CHAPTER_END}}}}}"),
+        last_chapter_end,
+    )
+}
+
+/// 上一章末尾衔接点正文块与硬约束行（`last_chapter_end` 为空时两者皆空）。
+pub fn chapter_seam_sections(last_chapter_end: &str) -> (String, String) {
+    let tail = last_chapter_end.trim();
+    if tail.is_empty() {
+        return (String::new(), String::new());
+    }
+    let block = format!("[上一章末尾衔接点]\n{tail}\n\n");
+    let rule_template = "         1.1 本章开头必须在地理位置、人物动作上与以下片段实现零秒缝合：{{LAST_CHAPTER_END}}\n";
+    let rule = substitute_prompt_vars(rule_template, tail);
+    (block, rule)
+}
+
+/// 写作管线 / 定时写作用的 Markdown 衔接块与硬约束（与 [`chapter_seam_sections`] 文案一致）。
+pub fn chapter_seam_markdown_sections(last_chapter_end: &str) -> (String, String) {
+    let tail = last_chapter_end.trim();
+    if tail.is_empty() {
+        return (String::new(), String::new());
+    }
+    let block = format!("## 上一章末尾衔接点\n{tail}\n\n");
+    let rule = substitute_prompt_vars(
+        "本章开头必须在地理位置、人物动作上与以下片段实现零秒缝合：{{LAST_CHAPTER_END}}\n\n",
+        tail,
+    );
+    (block, rule)
+}
+
 /// 构造生成章节的 (system, user) prompt。严格对齐 inkoswin.
 ///
 /// `beats`：本章节拍（Beats First Workflow）。若非空，会作为最高优先级的 `[本章节拍]` 段
@@ -106,8 +415,17 @@ pub fn build_generation_prompts(
     beats: &[String],
     current_draft: &str,
     state_documents: &HashMap<String, String>,
+    last_chapter_end: &str,
 ) -> (String, String) {
-    let system_prompt = "你是一名资深中文长篇小说作者。请根据已有设定续写章节，保持人物性格、世界观、伏笔和叙事节奏一致。不要解释创作过程，不要输出额外说明，只输出小说章节内容。".to_string();
+    let chapter_num = target_chapter.number;
+    let system_prompt = if chapter_num <= 1 {
+        "你是一名资深中文长篇小说作者。请根据已有设定创作开篇第一章：以悬念与氛围为主，不要解释创作过程。\
+输出须含标题/摘要/正文三段；正文结束后可追加一个闭合的 ```json 代码围栏用于 pending_hooks.md，除此之外不要输出解释。"
+            .to_string()
+    } else {
+        "你是一名资深中文长篇小说作者。请根据已有设定续写章节，保持人物性格、世界观、伏笔和叙事节奏一致。\
+不要解释创作过程，不要输出额外说明，只输出小说章节内容。".to_string()
+    };
 
     // 最近 12 章摘要
     let summary_tail: Vec<&(ChapterRecord, String)> = previous_materials
@@ -220,9 +538,23 @@ pub fn build_generation_prompts(
         s
     };
     let beats_rule = if cleaned_beats.is_empty() {
-        ""
+        String::new()
     } else {
-        "         2.1 必须依次推进上方[本章节拍]的每一条节拍，禁止跳过或新增大方向。\n"
+        "         2.1 必须依次推进上方[本章节拍]的每一条节拍，禁止跳过或新增大方向。\n".to_string()
+    };
+
+    let (seam_block, seam_rule) = chapter_seam_sections(last_chapter_end);
+    let pending_hooks_section = pending_hooks_focus_section(chapter_num, state_documents);
+    let chapter1_json_output = if chapter_num <= 1 {
+        chapter1_hooks_json_output_section()
+    } else {
+        ""
+    };
+    let extra_raw = project.extra_guidance.trim();
+    let extra = if extra_raw.is_empty() {
+        "无".to_string()
+    } else {
+        substitute_prompt_vars(extra_raw, last_chapter_end.trim())
     };
 
     let user_prompt = format!(
@@ -240,12 +572,16 @@ pub fn build_generation_prompts(
          - 文风与节奏：{writing_style}\n\n\
          [总纲与后续方向]\n{outline}\n\n\
          [额外要求]\n{extra}\n\n\
+         {atmosphere_section}\
          [前文摘要]\n{history_summary}\n\n\
          [最近章节正文节选]\n{recent_excerpt}\n\n\
+         {seam_block}\
+         {pending_hooks_section}\
          [连续性档案]\n{continuity_text}\n\n\
          [当前章节现有草稿]\n{draft_text}\n\n\
          请满足以下要求：\n\
          1. 情节必须承接前文，不能与既有设定冲突。\n\
+         {seam_rule}\
          2. 章节要有明显推进，不能只写重复铺垫。\n\
          {beats_rule}\
          3. 如果建议标题不合适，可以优化，但仍要符合当前情节。\n\
@@ -254,8 +590,9 @@ pub fn build_generation_prompts(
          标题：章节标题\n\
          摘要：80字以内摘要\n\
          正文：\n\
-         章节正文\n",
-        n = target_chapter.number,
+         章节正文\n\
+         {chapter1_json_output}",
+        n = chapter_num,
         word_goal = project.chapter_word_goal,
         genre = blank_or(&project.genre, "未指定"),
         premise = blank_or(&project.premise, "未填写"),
@@ -263,7 +600,7 @@ pub fn build_generation_prompts(
         world_setting = blank_or(&project.world_setting, "未填写"),
         writing_style = blank_or(&project.writing_style, "未填写"),
         outline = blank_or(&project.outline, "未填写"),
-        extra = blank_or(&project.extra_guidance, "无"),
+        atmosphere_section = chapter_dynamic_bracket_section(chapter_num),
     );
 
     (system_prompt, user_prompt)
@@ -443,10 +780,407 @@ fn blank_or(s: &str, fallback: &str) -> String {
     }
 }
 
+/// 新建小说向导「AI 灵感生成」解析结果，对应 `NovelProject` 四字段。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InitSettingsParsed {
+    pub premise: String,
+    pub protagonists: String,
+    pub world_setting: String,
+    pub writing_style: String,
+}
+
+impl InitSettingsParsed {
+    /// 仅将非空字段写入 `project`，避免解析不完整时覆盖用户已有输入。
+    pub fn merge_into(&self, project: &mut NovelProject) {
+        if !self.premise.trim().is_empty() {
+            project.premise = self.premise.clone();
+        }
+        if !self.protagonists.trim().is_empty() {
+            project.protagonists = self.protagonists.clone();
+        }
+        if !self.world_setting.trim().is_empty() {
+            project.world_setting = self.world_setting.clone();
+        }
+        if !self.writing_style.trim().is_empty() {
+            project.writing_style = self.writing_style.clone();
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InitSection {
+    Premise,
+    Protagonists,
+    World,
+    Style,
+}
+
+fn strip_heading_noise(mut s: &str) -> &str {
+    s = s.trim();
+    while s.starts_with('#') {
+        s = s.trim_start_matches('#').trim_start();
+    }
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i > 0 && i < bytes.len() {
+        let after = &s[i..];
+        if let Some(rest) = after
+            .strip_prefix('.')
+            .or_else(|| after.strip_prefix('、'))
+            .or_else(|| after.strip_prefix(')'))
+            .or_else(|| after.strip_prefix('）'))
+        {
+            s = rest.trim_start();
+        }
+    }
+    s.trim()
+}
+
+fn is_premise_heading(h: &str, compact: &str) -> bool {
+    if compact.contains("故事核心") && compact.contains("前提") {
+        return true;
+    }
+    if compact.contains("故事核心") && (compact.contains("与前提") || compact.contains("和前提")) {
+        return true;
+    }
+    if h == "故事核心" || compact == "故事核心" {
+        return true;
+    }
+    // 短行且以「故事核心」开头，视为小节标题（避免吞掉长段正文）
+    if h.starts_with("故事核心") {
+        let after = h["故事核心".len()..].trim();
+        if after.is_empty()
+            || after.starts_with('/')
+            || after.starts_with('／')
+            || after.starts_with('与')
+            || after.starts_with('和')
+            || after.starts_with('：')
+            || after.starts_with(':')
+        {
+            return true;
+        }
+        // 避免把正文「故事核心在于……」误判为标题
+        let body_like = ["在于", "是", "围绕", "讲述", "描述", "展现", "通过", "从", "在"];
+        if body_like.iter().any(|p| after.starts_with(*p)) {
+            return false;
+        }
+    }
+    false
+}
+
+fn classify_init_section_line(line: &str) -> Option<InitSection> {
+    let h = strip_heading_noise(line);
+    let compact: String = h.chars().filter(|c| !c.is_whitespace()).collect();
+    if is_premise_heading(h, &compact) {
+        return Some(InitSection::Premise);
+    }
+    if h.starts_with("主角与关键角色") {
+        return Some(InitSection::Protagonists);
+    }
+    if h.starts_with("世界观与背景") {
+        return Some(InitSection::World);
+    }
+    if h.starts_with("文风与节奏要求") {
+        return Some(InitSection::Style);
+    }
+    None
+}
+
+/// 构造「新建小说 · 初始设定」的 (system, user) prompt。
+/// `genre` 表示小说类型（如玄幻 / 悬疑），写入 user 上下文。
+pub fn generate_init_settings_prompt(name: &str, genre: &str) -> (String, String) {
+    let title = name.trim();
+    let g = genre.trim();
+    let system = "你是一名资深中文长篇小说架构师。仅用中文输出可直接粘贴进写作工作台的设定正文。\
+禁止输出 Markdown 围栏（```）、JSON、YAML、表格；禁止自我解释或「以下为……」以外的多余前言——若必须过渡，至多一行后立即进入第一段。\
+输出必须恰好四段：每段首行必须为下列方括号标签行之一，且标签行与原文字符完全一致（半角括号 [ ]、半角冒号 : 或中文冒号 ：均可）；标签行后即换行写正文，正文可多段落。\
+四段都要有实质信息量，缺一不可。";
+
+    let user = format!(
+        "请基于下列信息构思小说骨架。\n\
+         - 书名 / 暂定名：{title}\n\
+         - 小说类型：{g}\n\n\
+         请严格按下列四段输出（每段首行必须为标签行，下一行起为正文）：\n\n\
+         [故事核心 / 前提]：\n\
+         （须覆盖：核心冲突、主角目标、故事背景。）\n\n\
+         [主角与关键角色]：\n\
+         （须有主角姓名、性格、能力要点；另外写清 2～3 名重要配角（姓名或身份 + 简要作用）。）\n\n\
+         [世界观与背景]：\n\
+         （须交代：时代背景、主要地理区域、魔法体系或科技体系（二选一或与题材相符的等价设定亦可）。）\n\n\
+         [文风与节奏要求]：\n\
+         （须明示：叙事视角（如第一人称 / 第三人称）、文笔取向（简练 / 华丽等）、情境节奏偏好（快节奏 / 慢生活等）。）\n\n\
+         重要：不要使用 ``` 围栏；不要使用除上述四类 [] 标签外的Markdown标题体系（避免 #）；四段正文均不得为空。\n\
+         四段可按上述顺序自上而下排列。"
+    );
+    (system.to_string(), user)
+}
+
+fn init_bracket_header_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // 单行小节标签，如 `[故事核心 / 前提]`；避免跨行抓取正文
+        Regex::new(r"(?msi)\[\s*[^\[\]]+?\]\s*[：:]?").expect("valid regex")
+    })
+}
+
+fn normalize_wide_brackets(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '［' => '[',
+            '］' => ']',
+            c => c,
+        })
+        .collect()
+}
+
+fn strip_outer_md_fence(s: &str) -> String {
+    let t = s.trim();
+    if let Some(rest) = t.strip_prefix("```") {
+        let body = rest
+            .find('\n')
+            .map(|i| rest[i + 1..].trim_start())
+            .unwrap_or(rest.trim());
+        return if let Some(end) = body.rfind("```") {
+            body[..end].trim().to_string()
+        } else {
+            body.trim().to_string()
+        };
+    }
+    t.to_string()
+}
+
+fn classify_bracket_label(matched: &str) -> Option<InitSection> {
+    let folded: String = matched
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '[' && *c != ']')
+        .collect();
+    if folded.contains("故事核心") {
+        if folded.contains("前提")
+            || folded.contains('/')
+            || folded.contains('／')
+            || folded == "故事核心"
+            || folded.contains("与前提")
+            || folded.contains("和前提")
+        {
+            return Some(InitSection::Premise);
+        }
+    }
+    if folded.contains("主角与关键角色") {
+        return Some(InitSection::Protagonists);
+    }
+    if folded.contains("世界观与背景") {
+        return Some(InitSection::World);
+    }
+    if folded.contains("文风与节奏要求") {
+        return Some(InitSection::Style);
+    }
+    None
+}
+
+/// 从 `generate_init_settings_prompt` 期望的 **[标签]：** 结构中解析四段；
+/// 若未找齐四个锚点则返回 `None`。
+pub fn parse_init_settings_bracketed(raw: &str) -> Option<InitSettingsParsed> {
+    let text = normalize_wide_brackets(&strip_outer_md_fence(raw.trim()));
+    if !text.contains('[') && !text.contains('［') {
+        return None;
+    }
+    let re = init_bracket_header_regex();
+
+    let mut best: [Option<(usize, usize)>; 4] = [None; 4];
+    for m in re.find_iter(&text) {
+        let s = m.as_str();
+        let kind = classify_bracket_label(s)?;
+        let idx = match kind {
+            InitSection::Premise => 0usize,
+            InitSection::Protagonists => 1,
+            InitSection::World => 2,
+            InitSection::Style => 3,
+        };
+        let hdr_start = m.start();
+        let hdr_end = m.end();
+        let take = match best[idx] {
+            None => true,
+            Some((prev_s, _)) => hdr_start < prev_s,
+        };
+        if take {
+            best[idx] = Some((hdr_start, hdr_end));
+        }
+    }
+
+    if best.iter().any(|slot| slot.is_none()) {
+        return None;
+    }
+
+    fn section_order(i: usize) -> InitSection {
+        match i {
+            0 => InitSection::Premise,
+            1 => InitSection::Protagonists,
+            2 => InitSection::World,
+            _ => InitSection::Style,
+        }
+    }
+
+    let mut anchors: Vec<(usize, usize, InitSection)> = Vec::with_capacity(4);
+    for i in 0..4 {
+        let (hs, he) = best[i].unwrap();
+        anchors.push((hs, he, section_order(i)));
+    }
+    anchors.sort_by_key(|a| a.0);
+
+    let mut out = InitSettingsParsed::default();
+    for i in 0..anchors.len() {
+        let (_hs, hdr_end, sec) = anchors[i];
+        let next_hdr = anchors.get(i + 1).map(|x| x.0).unwrap_or_else(|| text.len());
+        let chunk = text[hdr_end..next_hdr].trim().to_string();
+        match sec {
+            InitSection::Premise => out.premise = chunk,
+            InitSection::Protagonists => out.protagonists = chunk,
+            InitSection::World => out.world_setting = chunk,
+            InitSection::Style => out.writing_style = chunk,
+        }
+    }
+
+    Some(out)
+}
+
+fn merge_init_pick(pref: String, fb: String) -> String {
+    if !pref.trim().is_empty() {
+        pref
+    } else {
+        fb
+    }
+}
+
+fn bracket_has_any(hit: Option<&InitSettingsParsed>) -> bool {
+    hit.map(|p| {
+        !(p.premise.trim().is_empty()
+            && p.protagonists.trim().is_empty()
+            && p.world_setting.trim().is_empty()
+            && p.writing_style.trim().is_empty())
+    })
+    .unwrap_or(false)
+}
+
+/// 聚合解析：优先方括号 Markdown 段落；与各段 legacy 启发式互补（避免单侧失败丢字段）。
+pub fn parse_init_settings_output(raw: &str) -> InitSettingsParsed {
+    let bracket_opt = parse_init_settings_bracketed(raw);
+    let legacy = parse_legacy_init_settings(raw);
+    let Some(ref br) = bracket_opt else {
+        return legacy;
+    };
+    if !bracket_has_any(Some(br)) {
+        return legacy;
+    }
+    InitSettingsParsed {
+        premise: merge_init_pick(br.premise.clone(), legacy.premise.clone()),
+        protagonists: merge_init_pick(br.protagonists.clone(), legacy.protagonists.clone()),
+        world_setting: merge_init_pick(br.world_setting.clone(), legacy.world_setting.clone()),
+        writing_style: merge_init_pick(br.writing_style.clone(), legacy.writing_style.clone()),
+    }
+}
+
+/// 兼容旧模型的无括号四段标题 / orphan 容错解析。
+pub fn parse_legacy_init_settings(raw: &str) -> InitSettingsParsed {
+    let clean = raw.trim().trim_matches('`').trim();
+    let lines: Vec<&str> = clean.lines().collect();
+    let mut out = InitSettingsParsed::default();
+    let mut cur: Option<InitSection> = None;
+    let mut buf: Vec<String> = Vec::new();
+    // 尚未进入任一段时累积的行（模型常把核心梗概写在第一个小标题前）
+    let mut orphan: Vec<String> = Vec::new();
+
+    fn flush(section: Option<InitSection>, buf: &mut Vec<String>, out: &mut InitSettingsParsed) {
+        let joined = buf.join("\n").trim().to_string();
+        buf.clear();
+        let Some(s) = section else {
+            return;
+        };
+        match s {
+            InitSection::Premise => out.premise = joined,
+            InitSection::Protagonists => out.protagonists = joined,
+            InitSection::World => out.world_setting = joined,
+            InitSection::Style => out.writing_style = joined,
+        }
+    }
+
+    for raw_line in &lines {
+        let line = raw_line.trim_end();
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if cur.is_some() {
+                buf.push(String::new());
+            } else if !orphan.is_empty() {
+                orphan.push(String::new());
+            }
+            continue;
+        }
+        if let Some(kind) = classify_init_section_line(trimmed) {
+            // 模型跳过「故事核心」标题、直接把梗概写在「主角」之前：并入 premise
+            if cur.is_none()
+                && kind != InitSection::Premise
+                && out.premise.is_empty()
+                && !orphan.is_empty()
+            {
+                out.premise = orphan.join("\n").trim().to_string();
+                orphan.clear();
+            }
+            flush(cur.take(), &mut buf, &mut out);
+            // 显式出现「故事核心」标题时，丢弃标题前的短引言（多为套话）
+            if kind == InitSection::Premise {
+                orphan.clear();
+            }
+            // 允许「标题：正文」同在一行
+            let rest = strip_init_header_prefix(trimmed, kind);
+            cur = Some(kind);
+            if !rest.is_empty() {
+                buf.push(rest);
+            }
+            continue;
+        }
+        if let Some(ref _s) = cur {
+            buf.push(line.to_string());
+        } else {
+            orphan.push(line.to_string());
+        }
+    }
+    flush(cur, &mut buf, &mut out);
+    if out.premise.trim().is_empty() && !orphan.is_empty() {
+        out.premise = orphan.join("\n").trim().to_string();
+    }
+    out
+}
+
+fn strip_init_header_prefix(line: &str, kind: InitSection) -> String {
+    let h = strip_heading_noise(line)
+        .trim_end_matches(['：', ':'])
+        .trim();
+    let rest = match kind {
+        InitSection::Premise => h
+            .strip_prefix("故事核心 / 前提")
+            .or_else(|| h.strip_prefix("故事核心/前提"))
+            .or_else(|| h.strip_prefix("故事核心／前提"))
+            .or_else(|| h.strip_prefix("故事核心与前提"))
+            .or_else(|| h.strip_prefix("故事核心和前提"))
+            .or_else(|| h.strip_prefix("故事核心")),
+        InitSection::Protagonists => h.strip_prefix("主角与关键角色"),
+        InitSection::World => h.strip_prefix("世界观与背景"),
+        InitSection::Style => h.strip_prefix("文风与节奏要求"),
+    };
+    rest.unwrap_or("")
+        .trim()
+        .trim_start_matches(['：', ':'])
+        .trim()
+        .to_string()
+}
+
 /// 对齐 inkoswin `parse_generation_output`：解析「标题：/摘要：/正文：」三段。
-/// 兼容 `#` 开头的 Markdown 标题 fallback。
+/// 兼容 `#` 开头的 Markdown 标题 fallback；尾部 ```json 围栏（第一章悬念同步）会从正文中剥离。
 pub fn parse_generation_output(raw_text: &str, fallback_title: &str) -> ChapterGenerationResult {
-    let clean = raw_text.trim().trim_matches('`').trim();
+    let without_json = crate::state_sync::strip_audit_trailing_json_fence(raw_text);
+    let clean = without_json.trim().trim_matches('`').trim();
     let lines: Vec<&str> = clean.lines().collect();
 
     let mut title = String::new();
@@ -536,6 +1270,207 @@ pub fn parse_generation_output(raw_text: &str, fallback_title: &str) -> ChapterG
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn substitute_prompt_vars_replaces_last_chapter_end() {
+        let s = "衔接：{{LAST_CHAPTER_END}}，结束。";
+        assert_eq!(
+            substitute_prompt_vars(s, "她推开门"),
+            "衔接：她推开门，结束。"
+        );
+    }
+
+    #[test]
+    fn get_chapter_dynamic_prompt_ch1_has_prologue() {
+        let p = get_chapter_dynamic_prompt(1);
+        assert!(p.contains("第一章专属创作指令"));
+        assert!(p.contains("反大纲化与悬念构建"));
+        assert!(p.contains("信息遮蔽原则"));
+    }
+
+    #[test]
+    fn parse_audit_hooks_output_parses_fence() {
+        let raw = "```json\n{\"hooks\":[{\"source\":\"神秘短信\",\"type\":\"世界秘密\",\"status\":\"active\",\"urgency\":4}]}\n```";
+        let r = parse_audit_hooks_output(raw).unwrap();
+        assert_eq!(r.hooks.len(), 1);
+        assert!(r.hooks[0].source.contains("神秘短信"));
+    }
+
+    #[test]
+    fn hooks_report_to_markdown_formats_three_fields() {
+        let report = AuditHooksReport {
+            hooks: vec![AuditHookEntry {
+                source: "雕像裂开".into(),
+                hook_type: "世界秘密".into(),
+                status: "active".into(),
+                urgency: 5,
+            }],
+        };
+        let md = hooks_report_to_pending_hooks_markdown(&report);
+        assert!(md.contains("[线索片段]"));
+        assert!(md.contains("[潜在指向]"));
+        assert!(md.contains("雕像裂开"));
+    }
+
+    #[test]
+    fn get_chapter_dynamic_prompt_ch2_has_continuity_hooks() {
+        let p = get_chapter_dynamic_prompt(2);
+        assert!(p.contains("连贯性要求"));
+        assert!(p.contains("pending_hooks"));
+    }
+
+    #[test]
+    fn parse_generation_output_strips_trailing_json_fence() {
+        let raw = "标题：夜\n摘要：短\n正文：\n她推开门。\n\n```json\n{\"summary\":\"hooks\",\"updates\":[]}\n```";
+        let r = parse_generation_output(raw, "第1章");
+        assert!(r.content.contains("她推开门"));
+        assert!(!r.content.contains("```json"));
+        assert!(!r.content.contains("\"updates\""));
+    }
+
+    #[test]
+    fn build_generation_prompts_ch1_includes_json_output_rule() {
+        let project = NovelProject::default();
+        let target = ChapterRecord {
+            number: 1,
+            title: "第一章".into(),
+            summary: String::new(),
+            status: "draft".into(),
+            word_count: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
+            beats: Vec::new(),
+            end_snapshot: String::new(),
+        };
+        let (_sys, user) = build_generation_prompts(
+            &project,
+            &target,
+            &[],
+            &[],
+            "",
+            &HashMap::new(),
+            "",
+        );
+        assert!(user.contains("pending_hooks.md"));
+        assert!(user.contains("第一章专属创作指令"));
+    }
+
+    #[test]
+    fn build_generation_prompts_ch2_includes_pending_hooks_focus() {
+        let project = NovelProject::default();
+        let target = ChapterRecord {
+            number: 2,
+            title: "第二章".into(),
+            summary: String::new(),
+            status: "draft".into(),
+            word_count: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
+            beats: Vec::new(),
+            end_snapshot: String::new(),
+        };
+        let mut docs = HashMap::new();
+        docs.insert(
+            "pending_hooks.md".to_string(),
+            "## 核心伏笔\n- 左眼金光".to_string(),
+        );
+        let (_sys, user) = build_generation_prompts(
+            &project,
+            &target,
+            &[],
+            &[],
+            "",
+            &docs,
+            "",
+        );
+        assert!(user.contains("[待回收伏笔（必须推进）]"));
+        assert!(user.contains("左眼金光"));
+    }
+
+    #[test]
+    fn chapter_seam_sections_empty_when_no_tail() {
+        let (block, rule) = chapter_seam_sections("");
+        assert!(block.is_empty());
+        assert!(rule.is_empty());
+    }
+
+    #[test]
+    fn build_generation_prompts_injects_seam_when_last_chapter_end_set() {
+        let project = NovelProject {
+            title: "测试书".into(),
+            genre: "玄幻".into(),
+            premise: "核心".into(),
+            extra_guidance: "自定义 {{LAST_CHAPTER_END}}".into(),
+            chapter_word_goal: 3000,
+            ..NovelProject::default()
+        };
+        let target = ChapterRecord {
+            number: 2,
+            title: "第二章".into(),
+            summary: String::new(),
+            status: "draft".into(),
+            word_count: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
+            beats: Vec::new(),
+            end_snapshot: String::new(),
+        };
+        let prev = ChapterRecord {
+            number: 1,
+            title: "第一章".into(),
+            summary: "摘要".into(),
+            status: "generated".into(),
+            word_count: 100,
+            created_at: String::new(),
+            updated_at: String::new(),
+            beats: Vec::new(),
+            end_snapshot: String::new(),
+        };
+        let prev_body = "前文很长。".repeat(200);
+        let materials = vec![(prev, prev_body)];
+        let tail = "她停在城门口，雨还在下。";
+        let (_sys, user) = build_generation_prompts(
+            &project,
+            &target,
+            &materials,
+            &[],
+            "",
+            &HashMap::new(),
+            tail,
+        );
+        assert!(user.contains("[上一章末尾衔接点]"));
+        assert!(user.contains(tail));
+        assert!(user.contains("零秒缝合"));
+        assert!(user.contains("自定义 她停在城门口，雨还在下。"));
+    }
+
+    #[test]
+    fn build_generation_prompts_no_seam_for_first_chapter() {
+        let project = NovelProject::default();
+        let target = ChapterRecord {
+            number: 1,
+            title: "第一章".into(),
+            summary: String::new(),
+            status: "draft".into(),
+            word_count: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
+            beats: Vec::new(),
+            end_snapshot: String::new(),
+        };
+        let (_sys, user) = build_generation_prompts(
+            &project,
+            &target,
+            &[],
+            &[],
+            "",
+            &HashMap::new(),
+            "",
+        );
+        assert!(!user.contains("[上一章末尾衔接点]"));
+        assert!(!user.contains("零秒缝合"));
+    }
 
     #[test]
     fn parse_standard_form() {
@@ -580,9 +1515,113 @@ mod tests {
     }
 
     #[test]
-    fn beats_parse_ignores_blank_lines_and_fences() {
-        let raw = "```\n\n  - a\n\n  b\n\n```";
-        let beats = parse_beats_output(raw);
-        assert_eq!(beats, vec!["a".to_string(), "b".to_string()]);
+    fn init_settings_parse_four_sections() {
+        let raw = "以下为设定。\n\n\
+             故事核心 / 前提\n\
+             核心A\n\
+             核心B\n\n\
+             主角与关键角色\n\
+             角色线\n\n\
+             世界观与背景\n\
+             世界\n\n\
+             文风与节奏要求\n\
+             文风\n";
+        let p = parse_init_settings_output(raw);
+        assert_eq!(p.premise, "核心A\n核心B");
+        assert_eq!(p.protagonists, "角色线");
+        assert_eq!(p.world_setting, "世界");
+        assert_eq!(p.writing_style, "文风");
+    }
+
+    #[test]
+    fn init_settings_markdown_story_core_only_heading() {
+        let raw = "## 故事核心\n\
+             这是核心段落。\n\n\
+             主角与关键角色\n\
+             张三\n";
+        let p = parse_init_settings_output(raw);
+        assert_eq!(p.premise, "这是核心段落。");
+        assert_eq!(p.protagonists, "张三");
+    }
+
+    #[test]
+    fn init_settings_preamble_before_protagonists_becomes_premise() {
+        let raw = "在一个赛博朋克都市里，主角寻找失踪的妹妹。\n\n\
+             主角与关键角色\n\
+             主角：林夜\n";
+        let p = parse_init_settings_output(raw);
+        assert!(p.premise.contains("赛博朋克"));
+        assert!(p.protagonists.contains("林夜"));
+    }
+
+    #[test]
+    fn init_settings_numbered_premise_heading() {
+        let raw = "1. 故事核心 / 前提\n\
+             核心内容\n\n\
+             主角与关键角色\n\
+             配角\n";
+        let p = parse_init_settings_output(raw);
+        assert_eq!(p.premise, "核心内容");
+        assert_eq!(p.protagonists, "配角");
+    }
+
+    #[test]
+    fn init_settings_bracketed_four_blocks() {
+        let raw = "好的，请查收。\n\n\
+             [故事核心 / 前提]:\n\
+             - 冲突：A\n\
+             - 目标：B\n\
+             - 背景：C\n\n\
+             [主角与关键角色]:\n\
+             主角林某；配角甲乙。\n\n\
+             [世界观与背景]:\n\
+             架空古代，东海郡，灵脉体系。\n\n\
+             [文风与节奏要求]:\n\
+             第三人称；简练；快节奏。\n";
+        assert!(parse_init_settings_bracketed(raw).is_some());
+        let p = parse_init_settings_output(raw);
+        assert!(p.premise.contains("冲突"));
+        assert!(p.protagonists.contains("林某"));
+        assert!(p.world_setting.contains("灵脉"));
+        assert!(p.writing_style.contains("第三人称"));
+    }
+
+    #[test]
+    fn init_settings_bracketed_wide_brackets() {
+        let raw = "\
+             ［故事核心 / 前提］：\n梗概一行\n\
+             \n\
+             [主角与关键角色]:\n张三\n\
+             \n\
+             [世界观与背景]\n某地\n\
+             \n\
+             [文风与节奏要求]:\n第一人称。\n";
+        let p = parse_init_settings_output(raw);
+        assert_eq!(p.premise.lines().next().unwrap().trim(), "梗概一行");
+        assert!(p.protagonists.contains("张三"));
+        assert!(p.world_setting.contains("某地"));
+        assert!(p.writing_style.contains("第一人称"));
+    }
+
+    #[test]
+    fn init_settings_fallback_when_brackets_incomplete() {
+        let raw = "[故事核心 / 前提]:\n仅此一段\n";
+        assert!(parse_init_settings_bracketed(raw).is_none());
+        assert!(parse_init_settings_output(raw).premise.contains("仅此"));
+    }
+
+    #[test]
+    fn init_settings_same_line_after_colon() {
+        let raw = "故事核心 / 前提：一行核心\n\n\
+             主角与关键角色：张三\n\n\
+             世界观与背景\n\
+             架空\n\n\
+             文风与节奏要求\n\
+             快";
+        let p = parse_init_settings_output(raw);
+        assert_eq!(p.premise, "一行核心");
+        assert_eq!(p.protagonists, "张三");
+        assert_eq!(p.world_setting, "架空");
+        assert_eq!(p.writing_style, "快");
     }
 }
