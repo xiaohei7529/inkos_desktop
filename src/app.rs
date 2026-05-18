@@ -18,7 +18,9 @@ use crate::llm::{
     ModelsFetchTask,
 };
 use crate::oplog::{self, OpLogEntry};
-use crate::project::{self, NovelProject, ProjectStore};
+use crate::project::{
+    self, NarrativeDensity, NarrativePov, NovelProject, ProjectStore, StylePreset,
+};
 use crate::state_sync::{self, StateFileChange, StateUpdate};
 use crate::theme::{self, color, dim_label, page_header, section_label};
 use crate::vendors::{find as find_vendor, VENDORS};
@@ -93,6 +95,19 @@ enum AutoGenPhase {
     AuditingPrev { prev_n: i32, next_n: i32 },
     /// 第二步（或非链式时的唯一一步）：写下一章。
     Writing { next_n: i32 },
+}
+
+/// 写作完成后「后置摘要」子任务挂起信息。
+#[derive(Clone)]
+struct PostWritePending {
+    chapter_no: i32,
+    title: String,
+    body: String,
+    /// 定时写作已在生成阶段落盘正文。
+    auto_saved: bool,
+    /// 完成后是否触发「章节保存后自动刷新长期记忆」。
+    defer_auto_refresh: bool,
+    include_book_rules_on_refresh: bool,
 }
 
 #[derive(Default, Clone, PartialEq)]
@@ -285,8 +300,9 @@ pub struct InkOsApp {
     beats_gen_task: Option<LlmTask>,
     beats_gen_target: Option<i32>,
 
-    /// 第一章完成后：独立 LLM 子任务，从正文提取悬念钩子并写入 pending_hooks.md。
-    hooks_extract_task: Option<LlmTask>,
+    /// 章节写作完成后：后置摘要/伏笔/状态同步子任务。
+    post_write_context_task: Option<LlmTask>,
+    post_write_pending: Option<PostWritePending>,
 
     // 「AI 生成 book_rules.md」专用任务（对齐 Narcooo/inkos 的 architect.bookRulesPrompt）。
     // 与 manual_gen_task 隔离，避免与正文生成互相阻塞。
@@ -480,7 +496,8 @@ impl InkOsApp {
             beats_dirty: false,
             beats_gen_task: None,
             beats_gen_target: None,
-            hooks_extract_task: None,
+            post_write_context_task: None,
+            post_write_pending: None,
             book_rules_gen_task: None,
             pending_book_rules_confirm: false,
             pending_book_rules_sync_on_save: false,
@@ -609,7 +626,8 @@ impl InkOsApp {
         self.beats_dirty = false;
         self.beats_gen_task = None;
         self.beats_gen_target = None;
-        self.hooks_extract_task = None;
+        self.post_write_context_task = None;
+        self.post_write_pending = None;
         self.book_rules_gen_task = None;
         self.pending_book_rules_confirm = false;
         self.pending_book_rules_sync_on_save = false;
@@ -1086,8 +1104,8 @@ impl InkOsApp {
         if self.beats_gen_task.is_some() {
             return Some("请先完成或取消节拍生成".into());
         }
-        if self.hooks_extract_task.is_some() {
-            return Some("第一章悬念提取正在进行".into());
+        if self.post_write_context_task.is_some() {
+            return Some("章节后置摘要正在进行".into());
         }
         if self.book_rules_gen_task.is_some() {
             return Some("请先完成或取消 book_rules 生成".into());
@@ -1770,10 +1788,10 @@ impl InkOsApp {
                 any_running = true;
             }
         }
-        if let Some(task) = &mut self.hooks_extract_task {
+        if let Some(task) = &mut self.post_write_context_task {
             task.drain();
             if task.done {
-                self.handle_hooks_extract_done();
+                self.handle_post_write_context_done();
             } else {
                 any_running = true;
             }
@@ -3511,6 +3529,9 @@ impl InkOsApp {
                             "时代、地域、魔法/科技体系…", "wz_world");
                         multiline_field(ui, "文风与节奏要求", &mut self.wizard_project.writing_style,
                             "叙事视角、文笔风格、情节节奏…", "wz_style");
+
+                        ui.add_space(8.0);
+                        Self::ui_narrative_frame_combos(ui, &mut self.wizard_project);
 
                         ui.label(RichText::new("目标章节数").size(11.5).color(color::TEXT_DIM));
                         ui.add(
@@ -6565,16 +6586,36 @@ impl InkOsApp {
         );
     }
 
-    /// 第一章正文生成完成后：若正文尾部未带可解析的悬念 JSON，则启动独立悬念审计子任务。
-    fn start_hooks_extraction_subtask(&mut self, chapter_title: &str, chapter_body: &str) {
-        if self.hooks_extract_task.is_some() {
+    /// 章节正文生成完成后：启动后置摘要/伏笔/状态同步子任务。
+    fn start_post_write_context_task(
+        &mut self,
+        chapter_no: i32,
+        chapter_title: &str,
+        chapter_body: &str,
+        auto_saved: bool,
+        defer_auto_refresh: bool,
+        include_book_rules_on_refresh: bool,
+    ) {
+        if self.post_write_context_task.is_some() {
             return;
         }
         if chapter_body.trim().is_empty() {
+            if defer_auto_refresh {
+                self.auto_refresh_state_after_chapter_saved(
+                    chapter_no,
+                    include_book_rules_on_refresh,
+                );
+            }
             return;
         }
         let vendor_id = self.settings.writing_vendor.clone();
         if vendor_id.is_empty() {
+            if defer_auto_refresh {
+                self.auto_refresh_state_after_chapter_saved(
+                    chapter_no,
+                    include_book_rules_on_refresh,
+                );
+            }
             return;
         }
         let Some(cfg) = self.vendor_config(&vendor_id) else {
@@ -6588,7 +6629,8 @@ impl InkOsApp {
             .as_ref()
             .map(|p| p.genre.clone())
             .unwrap_or_default();
-        let (system_prompt, user_prompt) = inkoswin_prompt::build_audit_hooks_prompts(
+        let (system_prompt, user_prompt) = inkoswin_prompt::build_extract_chapter_context_prompts(
+            chapter_no,
             chapter_title,
             chapter_body,
             &genre,
@@ -6598,77 +6640,175 @@ impl InkOsApp {
             ChatMessage::user(user_prompt),
         ];
         let model = cfg.model.clone();
-        self.hooks_extract_task = Some(spawn_chat(cfg, vendor_id, model, messages, false));
-        self.status_message = "第 1 章已生成；正在提取悬念钩子…".into();
+        self.post_write_pending = Some(PostWritePending {
+            chapter_no,
+            title: chapter_title.to_string(),
+            body: chapter_body.to_string(),
+            auto_saved,
+            defer_auto_refresh,
+            include_book_rules_on_refresh,
+        });
+        self.post_write_context_task = Some(spawn_chat(cfg, vendor_id, model, messages, false));
+        self.status_message = format!("第 {chapter_no} 章已生成；正在生成本章结构化摘要…");
         oplog::try_append(
             self.novel_path.as_deref(),
-            "AI 悬念提取 · 开始",
-            chapter_title,
+            "AI 后置摘要 · 开始",
+            &format!("第 {chapter_no} 章 · {chapter_title}"),
         );
     }
 
-    fn handle_hooks_extract_done(&mut self) {
-        let Some(task) = self.hooks_extract_task.take() else {
+    fn handle_post_write_context_done(&mut self) {
+        let Some(task) = self.post_write_context_task.take() else {
             return;
         };
+        let pending = self.post_write_pending.take();
+        let Some(pending) = pending else {
+            return;
+        };
+        let chapter_no = pending.chapter_no;
+
+        let finish_deferred_refresh = |app: &mut Self| {
+            if pending.defer_auto_refresh {
+                app.auto_refresh_state_after_chapter_saved(
+                    chapter_no,
+                    pending.include_book_rules_on_refresh,
+                );
+            }
+        };
+
         if let Some(err) = task.error.clone() {
-            self.status_message = format!("悬念提取失败：{err}");
+            self.status_message = format!("后置摘要失败：{err}");
             oplog::try_append(
                 self.novel_path.as_deref(),
-                "AI 悬念提取 · 失败",
+                "AI 后置摘要 · 失败",
                 &err,
             );
+            finish_deferred_refresh(self);
             return;
         }
         let raw = task.accumulated.trim();
         if raw.is_empty() {
-            self.status_message = "悬念提取结果为空".into();
+            self.status_message = "后置摘要结果为空".into();
+            finish_deferred_refresh(self);
             return;
         }
-        match inkoswin_prompt::parse_audit_hooks_output(raw) {
+
+        match inkoswin_prompt::parse_chapter_context_output(raw) {
             Ok(report) => {
-                let count = report.hooks.len();
-                if count == 0 {
-                    self.status_message = "悬念提取完成，但未识别到有效钩子".into();
-                    return;
-                }
-                if let (Some(root), Some(store)) = (&self.novel_path, &self.store) {
-                    match state_sync::apply_audit_hooks_report(
+                let novel_root = match self.novel_path.clone() {
+                    Some(r) => r,
+                    None => {
+                        finish_deferred_refresh(self);
+                        return;
+                    }
+                };
+                let state_dir = match self.store.as_ref() {
+                    Some(s) => s.state_dir(),
+                    None => {
+                        finish_deferred_refresh(self);
+                        return;
+                    }
+                };
+                let title_hint = if pending.title.trim().is_empty() {
+                    format!("第{chapter_no}章")
+                } else {
+                    pending.title.trim().to_string()
+                };
+
+                let apply_result = {
+                    let Some(project) = self.project.as_mut() else {
+                        finish_deferred_refresh(self);
+                        return;
+                    };
+                    let Some(store) = self.store.as_ref() else {
+                        finish_deferred_refresh(self);
+                        return;
+                    };
+                    let _ = store.ensure_chapter(project, chapter_no, &title_hint);
+                    state_sync::apply_chapter_context_report(
                         &report,
-                        root,
-                        &store.state_dir(),
-                    ) {
-                        Ok(Some(_res)) => {
-                            self.refresh_pending_hooks();
-                            self.status_message =
-                                format!("已提取并同步 {count} 条悬念至 pending_hooks.md");
-                            oplog::try_append(
-                                self.novel_path.as_deref(),
-                                "AI 悬念提取 · 完成",
-                                &format!("{count} 条钩子"),
-                            );
+                        chapter_no,
+                        project,
+                        store,
+                        &novel_root,
+                        &state_dir,
+                    )
+                };
+
+                match apply_result {
+                    Ok(res) => {
+                        self.refresh_pending_hooks();
+                        let sum = res.summary.trim();
+                        if pending.auto_saved {
+                            let title = pending.title.clone();
+                            let body = pending.body.clone();
+                            let beats = self
+                                .project
+                                .as_ref()
+                                .and_then(|p| {
+                                    p.chapters
+                                        .iter()
+                                        .find(|c| c.number == chapter_no)
+                                        .map(|c| c.beats.clone())
+                                })
+                                .unwrap_or_default();
+                            if let (Some(st), Some(proj)) = (&self.store, &mut self.project) {
+                                let summary_str = if sum.is_empty() {
+                                    report.summary.trim()
+                                } else {
+                                    sum
+                                };
+                                let _ = st.save_chapter(
+                                    proj,
+                                    chapter_no,
+                                    &title,
+                                    &body,
+                                    "generated",
+                                    summary_str,
+                                    &beats,
+                                );
+                            }
+                        } else if self.selected_chapter == Some(chapter_no) && !sum.is_empty() {
+                            self.chapter_summary = sum.to_string();
+                            self.chapter_summary_dirty = true;
                         }
-                        Ok(None) => {
-                            self.status_message = "悬念提取完成，但未能写入档案".into();
-                        }
-                        Err(e) => {
-                            self.status_message = format!("悬念写入 pending_hooks 失败：{e}");
-                            oplog::try_append(
-                                self.novel_path.as_deref(),
-                                "AI 悬念提取 · 落盘失败",
-                                &e.to_string(),
-                            );
-                        }
+                        let hook_note = if res.hooks_applied > 0 {
+                            format!("；已同步 {} 条悬念", res.hooks_applied)
+                        } else {
+                            String::new()
+                        };
+                        self.status_message = format!(
+                            "第 {chapter_no} 章后置摘要已同步至档案{hook_note}"
+                        );
+                        oplog::try_append(
+                            self.novel_path.as_deref(),
+                            "AI 后置摘要 · 完成",
+                            &format!(
+                                "第 {chapter_no} 章 · 摘要 {} 字 · {} 条悬念",
+                                res.summary.chars().count(),
+                                res.hooks_applied
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        self.status_message = format!("后置摘要落盘失败：{e}");
+                        oplog::try_append(
+                            self.novel_path.as_deref(),
+                            "AI 后置摘要 · 落盘失败",
+                            &e.to_string(),
+                        );
                     }
                 }
+                finish_deferred_refresh(self);
             }
             Err(e) => {
-                self.status_message = format!("悬念 JSON 解析失败：{e}");
+                self.status_message = format!("后置摘要 JSON 解析失败：{e}");
                 oplog::try_append(
                     self.novel_path.as_deref(),
-                    "AI 悬念提取 · 解析失败",
+                    "AI 后置摘要 · 解析失败",
                     &e.to_string(),
                 );
+                finish_deferred_refresh(self);
             }
         }
     }
@@ -6697,7 +6837,6 @@ impl InkOsApp {
         let result = inkoswin_prompt::parse_generation_output(&raw, &fallback_title);
 
         let mut hooks_sync_note = String::new();
-        let mut inline_hooks_applied = false;
         if target_n <= 1 {
             if let (Some(root), Some(store)) = (&self.novel_path, &self.store) {
                 match state_sync::apply_prologue_pending_hooks_from_raw(
@@ -6706,7 +6845,6 @@ impl InkOsApp {
                     &store.state_dir(),
                 ) {
                     Ok(Some(res)) => {
-                        inline_hooks_applied = true;
                         self.refresh_pending_hooks();
                         hooks_sync_note = format!(
                             "；已同步 {} 条悬念至 pending_hooks.md",
@@ -6741,12 +6879,12 @@ impl InkOsApp {
         self.chapter_body = result.content.clone();
         // 摘要：若 LLM 给出，则写入摘要编辑框并标记为 dirty 供用户一并保存；
         // 否则保留原摘要（parse_generation_output 已在 fallback 场景自动生成 make_summary）。
-        let normalized_summary = self.normalize_generated_summary(&result.summary, &self.chapter_body);
-        let summary_trim = normalized_summary.trim();
-        if !summary_trim.is_empty()
-            && summary_trim != self.chapter_summary.trim()
+        // 行内「摘要：」仅作预览；结构化真实摘要由后置任务写入。
+        let inline_summary = result.summary.trim();
+        if inline_summary.chars().count() >= 40
+            && inline_summary != self.chapter_summary.trim()
         {
-            self.chapter_summary = summary_trim.to_string();
+            self.chapter_summary = inline_summary.to_string();
             self.chapter_summary_dirty = true;
         }
         self.chapter_dirty = true;
@@ -6765,9 +6903,14 @@ impl InkOsApp {
             &format!("第 {target_n} 章 · {words} 字"),
         );
 
-        if target_n <= 1 && !inline_hooks_applied {
-            self.start_hooks_extraction_subtask(&result.title, &result.content);
-        }
+        self.start_post_write_context_task(
+            target_n,
+            &result.title,
+            &result.content,
+            false,
+            false,
+            false,
+        );
     }
 
     /// 「AI 生成 book_rules.md」（对齐 `Narcooo/inkos` `architect.bookRulesPrompt`）。
@@ -7008,7 +7151,6 @@ impl InkOsApp {
                 }
                 // 与「生成本章」对齐：优先解析 标题/摘要/正文 三段；
                 // 若模型未给摘要，则 parse_generation_output 会回退生成摘要。
-                let mut inline_hooks_applied = false;
                 if n <= 1 {
                     if let (Some(root), Some(store)) = (&self.novel_path, &self.store) {
                         match state_sync::apply_prologue_pending_hooks_from_raw(
@@ -7017,7 +7159,6 @@ impl InkOsApp {
                             &store.state_dir(),
                         ) {
                             Ok(Some(res)) => {
-                                inline_hooks_applied = true;
                                 self.refresh_pending_hooks();
                                 self.auto_gen_log.push(format!(
                                     "{}  已同步 {} 条悬念至 pending_hooks.md",
@@ -7055,9 +7196,9 @@ impl InkOsApp {
                 let body = result.content;
                 let summary = self.normalize_generated_summary(&result.summary, &body);
                 let novel_root = self.novel_path.clone();
-                let need_hooks_extract = n <= 1 && !inline_hooks_applied;
-                let hooks_title = title.clone();
-                let hooks_body = body.clone();
+                let post_write_title = title.clone();
+                let post_write_body = body.clone();
+                let defer_refresh = true;
                 let (Some(store), Some(project)) = (&self.store, &mut self.project) else { return };
                 let cur_beats = project
                     .chapters
@@ -7095,7 +7236,6 @@ impl InkOsApp {
                             timestamp: crate::project::now_iso(),
                         };
                         let _ = crate::notify::notify_all(&self.settings.notify, &evt);
-                        self.auto_refresh_state_after_chapter_saved(n, n == 1);
                     }
                     Err(e) => {
                         self.auto_gen_log
@@ -7116,9 +7256,14 @@ impl InkOsApp {
                         let _ = crate::notify::notify_all(&self.settings.notify, &evt);
                     }
                 }
-                if need_hooks_extract {
-                    self.start_hooks_extraction_subtask(&hooks_title, &hooks_body);
-                }
+                self.start_post_write_context_task(
+                    n,
+                    &post_write_title,
+                    &post_write_body,
+                    true,
+                    defer_refresh,
+                    n == 1,
+                );
                 self.auto_gen_audit_text.clear();
             }
         }
@@ -7165,6 +7310,52 @@ impl InkOsApp {
         }
     }
 
+    fn ui_narrative_frame_combos(ui: &mut egui::Ui, project: &mut NovelProject) {
+        ui.label(
+            RichText::new("叙事框架")
+                .size(12.0)
+                .color(color::TEXT_DIM)
+                .strong(),
+        );
+        ui.add_space(4.0);
+        ui.label(RichText::new("叙事视角 (POV)").size(11.5).color(color::TEXT_DIM));
+        ComboBox::from_id_salt("narrative_pov_pick")
+            .width(320.0)
+            .selected_text(project.pov.label_zh())
+            .show_ui(ui, |ui| {
+                for v in NarrativePov::ALL {
+                    if ui.selectable_label(project.pov == *v, v.label_zh()).clicked() {
+                        project.pov = *v;
+                    }
+                }
+            });
+        ui.add_space(6.0);
+        ui.label(RichText::new("叙事密度").size(11.5).color(color::TEXT_DIM));
+        ComboBox::from_id_salt("narrative_density_pick")
+            .width(320.0)
+            .selected_text(project.density.label_zh())
+            .show_ui(ui, |ui| {
+                for v in NarrativeDensity::ALL {
+                    if ui.selectable_label(project.density == *v, v.label_zh()).clicked() {
+                        project.density = *v;
+                    }
+                }
+            });
+        ui.add_space(6.0);
+        ui.label(RichText::new("文风包").size(11.5).color(color::TEXT_DIM));
+        ComboBox::from_id_salt("style_preset_pick")
+            .width(320.0)
+            .selected_text(project.style_preset.label_zh())
+            .show_ui(ui, |ui| {
+                for v in StylePreset::ALL {
+                    if ui.selectable_label(project.style_preset == *v, v.label_zh()).clicked() {
+                        project.style_preset = *v;
+                    }
+                }
+            });
+        ui.add_space(8.0);
+    }
+
     fn ui_meta_basics(&mut self, ui: &mut egui::Ui) {
         let mut save_clicked = false;
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
@@ -7198,7 +7389,8 @@ impl InkOsApp {
                             .desired_width(f32::INFINITY),
                     );
                 }
-                ui.add_space(8.0);
+                ui.add_space(10.0);
+                Self::ui_narrative_frame_combos(ui, project);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("目标章节数").size(11.5).color(color::TEXT_DIM));
                     ui.add(

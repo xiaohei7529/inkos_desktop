@@ -166,6 +166,7 @@ pub fn build_draft_prompt(
         let mut docs = std::collections::HashMap::new();
         for f in [
             "pending_hooks.md",
+            "chapter_summaries.md",
             "outline.md",
             "novel_brief.md",
             "current_state.md",
@@ -178,10 +179,33 @@ pub fn build_draft_prompt(
                 }
             }
         }
+        let mut previous_materials: Vec<(crate::project::ChapterRecord, String)> = Vec::new();
+        let mut sorted: Vec<&crate::project::ChapterRecord> = project.chapters.iter().collect();
+        sorted.sort_by_key(|c| c.number);
+        for ch in sorted {
+            if ch.number >= chapter_no {
+                break;
+            }
+            if let Ok((_t, body)) = store.load_chapter_content(ch.number) {
+                if !body.trim().is_empty() {
+                    previous_materials.push((ch.clone(), body));
+                }
+            }
+        }
+        out.push_str(&crate::inkoswin_prompt::recent_chapter_summaries_section(
+            chapter_no,
+            &docs,
+            &previous_materials,
+        ));
         out.push_str(&crate::inkoswin_prompt::pending_hooks_focus_section(
             chapter_no,
             &docs,
         ));
+        out.push_str(
+            "## 连贯性硬约束\n\
+             禁止跳跃时空：必须从前章末尾衔接点（500 字快照）的物理状态、地点与动作直接延续；\
+             须从待回收伏笔中挑选 1-2 条悬念推进或加深。\n\n",
+        );
     }
     if chapter_no <= 1 {
         out.push_str(crate::inkoswin_prompt::chapter1_hooks_json_output_section());

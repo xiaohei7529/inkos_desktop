@@ -81,6 +81,112 @@ fn default_status() -> String {
     "draft".to_string()
 }
 
+/// 叙事视角（POV），写入 `project.json` 并注入生成 Prompt。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NarrativePov {
+    #[default]
+    ThirdPersonLimited,
+    FirstPerson,
+    ThirdPersonOmniscient,
+}
+
+impl NarrativePov {
+    pub const ALL: &[NarrativePov] = &[
+        NarrativePov::ThirdPersonLimited,
+        NarrativePov::FirstPerson,
+        NarrativePov::ThirdPersonOmniscient,
+    ];
+
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            Self::ThirdPersonLimited => "第三人称限知（他/她，仅主角感官）",
+            Self::FirstPerson => "第一人称（我）",
+            Self::ThirdPersonOmniscient => "第三人称全知",
+        }
+    }
+
+    pub fn to_prompt_instruction(self) -> &'static str {
+        match self {
+            Self::FirstPerson => "【视角锁定】全文以第一人称「我」叙述主角；禁止将主角写成「他/她」；禁止中途切换为第三人称或第二人称「你」。",
+            Self::ThirdPersonLimited => "【视角锁定】第三人称限知视角：仅写主角能感知、思考与推断到的内容；禁止全知旁白泄露主角未知的信息；人称代词稳定使用「他/她」指代主角，禁止漂移为「我」或「你」。",
+            Self::ThirdPersonOmniscient => "【视角锁定】第三人称全知视角：可切换不同角色的所知所感，但同一段落内叙述距离须一致；禁止无标记地在第一人称「我」与第三人称之间跳跃。",
+        }
+    }
+}
+
+/// 叙事密度：环境描写 vs 动作推进的比例。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NarrativeDensity {
+    LowActionFocused,
+    #[default]
+    Medium,
+    HighAtmospheric,
+}
+
+impl NarrativeDensity {
+    pub const ALL: &[NarrativeDensity] = &[
+        NarrativeDensity::LowActionFocused,
+        NarrativeDensity::Medium,
+        NarrativeDensity::HighAtmospheric,
+    ];
+
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            Self::LowActionFocused => "低 · 动作推进为主",
+            Self::Medium => "中 · 描写与推进平衡",
+            Self::HighAtmospheric => "高 · 氛围沉浸为主",
+        }
+    }
+
+    pub fn to_prompt_instruction(self) -> &'static str {
+        match self {
+            Self::LowActionFocused => "【叙事密度·低】以动作、对话与因果推进为主；环境描写点到为止，单一场景内避免连续三段以上纯景物铺陈。",
+            Self::Medium => "【叙事密度·中】动作推进与环境/心理描写交替；每完成一个关键动作，可接 1–2 句感官或内心补笔，禁止无情节意义的重复铺陈。",
+            Self::HighAtmospheric => "【叙事密度·高】允许较慢节奏与较多氛围描写，但每 300–500 字仍须出现可感知的冲突、悬念或信息增量，禁止原地空转。",
+        }
+    }
+}
+
+/// 文风包：与剧情逻辑解耦的描写风格预设。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StylePreset {
+    #[default]
+    Standard,
+    HardboiledDetective,
+    LyricalFantasy,
+    SuspenseHorror,
+}
+
+impl StylePreset {
+    pub const ALL: &[StylePreset] = &[
+        StylePreset::Standard,
+        StylePreset::HardboiledDetective,
+        StylePreset::LyricalFantasy,
+        StylePreset::SuspenseHorror,
+    ];
+
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            Self::Standard => "标准 · 中性写实",
+            Self::HardboiledDetective => "冷硬派 · 侦探",
+            Self::LyricalFantasy => "华丽流 · 奇幻",
+            Self::SuspenseHorror => "悬疑 · 惊悚氛围",
+        }
+    }
+
+    pub fn to_prompt_instruction(self) -> &'static str {
+        match self {
+            Self::Standard => "【文风包·标准】语言简练、具象；Show don't tell；比喻克制，服务人物与情节。",
+            Self::HardboiledDetective => "【文风包·冷硬派】短句、克制、都市质感；对话锋利；情绪内敛，冲突外化为行动与细节。",
+            Self::LyricalFantasy => "【文风包·华丽流】允许比喻与意象，但须锚定人物五感；避免空洞堆砌形容词；奇幻设定通过行为与细节呈现。",
+            Self::SuspenseHorror => "【文风包·悬疑惊悚】强调未知与压迫感；局部特写代替全景说明；禁止提前解释谜底。",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NovelProject {
@@ -94,6 +200,15 @@ pub struct NovelProject {
     pub extra_guidance: String,
     pub target_chapters: i32,
     pub chapter_word_goal: i32,
+    /// 叙事视角（旧 `project.json` 缺字段时默认第三人称限知）。
+    #[serde(default)]
+    pub pov: NarrativePov,
+    /// 叙事密度。
+    #[serde(default)]
+    pub density: NarrativeDensity,
+    /// 文风包预设。
+    #[serde(default)]
+    pub style_preset: StylePreset,
     pub auto_generate: AutoGeneratePlan,
     pub chapters: Vec<ChapterRecord>,
     pub updated_at: String,
@@ -112,6 +227,9 @@ impl Default for NovelProject {
             extra_guidance: String::new(),
             target_chapters: 500,
             chapter_word_goal: 3000,
+            pov: NarrativePov::default(),
+            density: NarrativeDensity::default(),
+            style_preset: StylePreset::default(),
             auto_generate: AutoGeneratePlan::default(),
             chapters: Vec::new(),
             updated_at: now_iso(),
@@ -206,6 +324,13 @@ impl ProjectStore {
 
     pub fn get_chapter<'a>(project: &'a NovelProject, number: i32) -> Option<&'a ChapterRecord> {
         project.chapters.iter().find(|c| c.number == number)
+    }
+
+    pub fn get_chapter_mut<'a>(
+        project: &'a mut NovelProject,
+        number: i32,
+    ) -> Option<&'a mut ChapterRecord> {
+        project.chapters.iter_mut().find(|c| c.number == number)
     }
 
     /// 写作第 `target_n` 章时，解析上一章末尾衔接点（优先 `end_snapshot`，否则从正文计算）。
@@ -798,6 +923,16 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("已有小说档案"));
+    }
+
+    #[test]
+    fn novel_project_deserializes_without_narrative_fields() {
+        let json = r#"{"title":"旧书","genre":"玄幻","chapters":[]}"#;
+        let p: NovelProject = serde_json::from_str(json).unwrap();
+        assert_eq!(p.title, "旧书");
+        assert_eq!(p.pov, NarrativePov::ThirdPersonLimited);
+        assert_eq!(p.density, NarrativeDensity::Medium);
+        assert_eq!(p.style_preset, StylePreset::Standard);
     }
 
     #[test]

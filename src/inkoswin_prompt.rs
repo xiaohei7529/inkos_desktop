@@ -99,30 +99,43 @@ fn build_state_context_text(state_documents: &HashMap<String, String>) -> String
     }
 }
 
-/// 通用慢节奏、重氛围写作指导（全章节基础层）。
-pub const COMMON_WRITING_GUIDE: &str = r#"
-### 核心创作指令：慢节奏与重氛围 (Slow Burn & Atmosphere)
+/// 通用叙事工程基础层（题材无关）：实体追踪、信息增量、空间衔接。
+pub const NARRATIVE_ENGINE_CORE: &str = r#"
+### 叙事工程基础（全题材通用）
 
-1. **叙事比重控制 (Pacing Ratio)**：
-   - 严禁连续推进剧情。每发生一个动作（如：推门），必须配合至少 3 句以上的环境描写或内心独白。
-   - 剧情推进速度调慢 3 倍：第一章原本要写的“吃药”，请拆解为“观察药丸的纹理”、“闻到的古怪气味”、“指尖的颤抖”、“吞咽时的冰冷感”以及“药效在血管里散开的视觉异象”。
+1. **信息增量 (Information Increment)**：
+   - 每一章必须至少揭露一个新信息、完成一个可验证的小目标，或明显推进一条既有悬念；禁止整章原地打转的重复描写。
 
-2. **感官沉浸 (Sensory Detail - Show, Don't Tell)**：
-   - **视觉**：不要只说“雾大”，要说“路灯的光被浓雾撕碎，像溺水者的残喘”。
-   - **触觉/体感**：强调左眼刺痛的层次感——从针扎到火烧，再到冰冷的黏稠感爬上视神经。
-   - **听觉**：放大死寂中的噪音，如“停尸房冷柜压缩机的震动声在耳膜里激起阵阵嗡鸣”。
+2. **实体追踪 (Entity Tracking)**：
+   - 对已出现的关键道具/线索须标明物理状态（在手中、衣袋、车内、已丢弃等）；引入新道具时说明如何进入场景。
 
-3. **心理写实 (Psychological Depth)**：
-   - 增加林夜作为“阴阳眼值班员”的职业疲惫感与对未知的恐惧。
-   - 他对苏清婉的信任不应该是瞬间产生的，必须有审视、怀疑和本能的防备描写。
+3. **零跳跃衔接 (Seamless Transition)**：
+   - 禁止“推开门后已在街上”类空间跳跃；地点/时间变化须写出过渡动作与感官变化。
 
-4. **零跳跃衔接 (Seamless Transition)**：
-   - 严禁出现“推开门后我来到了街上”这种空间跳跃。
-   - 必须写出移动的过程：如何穿过走廊，推开沉重的铁门，冷风如何灌进领口，街上雾气的浓度对比，以及左眼在不同光线下的反应变化。
+4. **Show, Don't Tell**：
+   - 用具体动作、对话与感官细节承载情绪与世界观，避免作者口吻的解释性旁白。
 "#;
 
-/// 与 [`COMMON_WRITING_GUIDE`] 同义，保留旧名兼容。
-pub const ATMOSPHERE_STYLING: &str = COMMON_WRITING_GUIDE;
+/// 兼容旧名：已由 [`NARRATIVE_ENGINE_CORE`] + 项目级文风包替代题材硬编码。
+pub const COMMON_WRITING_GUIDE: &str = NARRATIVE_ENGINE_CORE;
+
+/// 与 [`NARRATIVE_ENGINE_CORE`] 同义，保留旧名兼容。
+pub const ATMOSPHERE_STYLING: &str = NARRATIVE_ENGINE_CORE;
+
+/// 从 `NovelProject` 组装 `[核心叙事强制约束]` 块（POV / 密度 / 文风包）。
+pub fn core_narrative_constraints_section(project: &NovelProject) -> String {
+    format!(
+        "[核心叙事强制约束]（最高优先级，须严格遵守）\n\
+         {}\n\
+         {}\n\
+         {}\n\
+         【信息增量】本章须推进至少一个具体目标或揭露一个新信息，禁止无意义的空转铺陈。\n\
+         【实体追踪】关键道具/线索须写明物理位置与状态；与 continuity 档案冲突时以档案为准。\n\n",
+        project.pov.to_prompt_instruction(),
+        project.density.to_prompt_instruction(),
+        project.style_preset.to_prompt_instruction(),
+    )
+}
 
 /// 第一章专属：悬念与锚点（与 [`CHAPTER_ONE_STRATEGY`] 互补，保留 JSON 输出提醒）。
 pub const PROLOGUE_SENSE_GUIDE: &str = r#"
@@ -189,6 +202,211 @@ pub struct AuditHookEntry {
 pub struct AuditHooksReport {
     #[serde(default)]
     pub hooks: Vec<AuditHookEntry>,
+}
+
+/// 后置摘要任务 LLM 输出：`summary` + `hooks` + `state_updates`。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChapterContextReport {
+    pub summary: String,
+    #[serde(default)]
+    pub hooks: Vec<String>,
+    #[serde(default)]
+    pub state_updates: ChapterStateUpdates,
+}
+
+/// 人物/世界状态增量（写入 current_state.md）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChapterStateUpdates {
+    #[serde(default)]
+    pub location: String,
+    #[serde(default)]
+    pub inventory: String,
+}
+
+/// 第 2 章起：续写硬约束（时空衔接 + 伏笔推进）。
+pub const CONTINUITY_SEAM_HARD_RULE: &str = "         1.2 禁止跳跃时空：必须从前章末尾衔接点（500 字快照）的物理状态、地点与动作直接延续叙述；本章须从 [待回收伏笔] 中挑选 1-2 条悬念进行推进或加深，不得抛弃已有钩子开启无关新线。\n";
+
+/// 构造「章节正文 → 结构化摘要/伏笔/状态」的 (system, user) prompt（写作完成后的后置子任务）。
+pub fn build_extract_chapter_context_prompts(
+    chapter_no: i32,
+    chapter_title: &str,
+    chapter_body: &str,
+    genre: &str,
+) -> (String, String) {
+    let body = trim_text(chapter_body.trim(), 12_000);
+    let genre_label = if genre.trim().is_empty() {
+        "通用长篇小说"
+    } else {
+        genre.trim()
+    };
+    let title = if chapter_title.trim().is_empty() {
+        format!("第{chapter_no}章")
+    } else {
+        chapter_title.trim().to_string()
+    };
+    let system_prompt = "你是一名长篇小说 continuity 编辑。请阅读章节正文，提取结构化剧情摘要、人物状态与未解悬念。\
+不要改写正文，不要输出 Markdown 说明，只输出一个 JSON 对象（可用 ```json 围栏包裹）。".to_string();
+    let user_prompt = format!(
+        "请阅读以下「{genre_label}」题材第 {chapter_no} 章《{title}》正文，输出结构化上下文。\n\n\
+         ## 正文\n{body}\n\n\
+         ## 输出要求\n\
+         严格输出如下 JSON Schema（字段名不可改）：\n\
+         {{\n\
+           \"summary\": \"结构化剧情总结：本章发生了什么（剧情进度，200字以内）；须含主角位置、心理状态、受伤/损耗情况\",\n\
+           \"hooks\": [\"悬念1\", \"悬念2\"],\n\
+           \"state_updates\": {{ \"location\": \"当前地点\", \"inventory\": \"获得或持有的关键道具/资源\" }}\n\
+         }}\n\n\
+         - summary：面向后续章节的真实摘要，禁止只写首句或空话。\n\
+         - hooks：文中留下、尚未解答的谜团/伏笔，每条一句，建议 2-5 条；无则 []。\n\
+         - state_updates：主角（或叙事焦点角色）章末所在地点与重要持物；未知则空字符串。"
+    );
+    (system_prompt, user_prompt)
+}
+
+/// 解析后置摘要 LLM 回包。
+pub fn parse_chapter_context_output(raw: &str) -> anyhow::Result<ChapterContextReport> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("后置摘要返回为空");
+    }
+    if let Ok(r) = serde_json::from_str::<ChapterContextReport>(trimmed) {
+        return Ok(r);
+    }
+    if let Some(body) = crate::state_sync::trailing_json_fence_body(trimmed) {
+        if let Ok(r) = serde_json::from_str::<ChapterContextReport>(body) {
+            return Ok(r);
+        }
+    }
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if end >= start {
+            let slice = &trimmed[start..=end];
+            if let Ok(r) = serde_json::from_str::<ChapterContextReport>(slice) {
+                return Ok(r);
+            }
+        }
+    }
+    anyhow::bail!("无法解析为 ChapterContextReport JSON")
+}
+
+/// 将 `hooks` 字符串列表格式化为 `pending_hooks.md` 增量条目。
+pub fn hooks_strings_to_pending_hooks_markdown(hooks: &[String]) -> String {
+    let mut blocks: Vec<String> = Vec::new();
+    for (i, h) in hooks.iter().enumerate() {
+        let source = h.trim();
+        if source.is_empty() {
+            continue;
+        }
+        let name = format!("悬念{}", i + 1);
+        blocks.push(format!(
+            "### [{name}]\n- [线索片段]：{source}\n- [潜在指向]：状态 active；由后置摘要任务提取，供后续章节推进\n",
+        ));
+    }
+    blocks.join("\n")
+}
+
+/// 从 `chapter_summaries.md` 正文提取最近 `limit` 个 `## 第N章` 块。
+pub fn extract_recent_chapter_summary_blocks(md: &str, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let trimmed = md.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let mut blocks: Vec<(i32, String)> = Vec::new();
+    let mut current_num: Option<i32> = None;
+    let mut current_lines: Vec<String> = Vec::new();
+
+    fn flush_block(blocks: &mut Vec<(i32, String)>, num: Option<i32>, lines: &mut Vec<String>) {
+        if let Some(n) = num {
+            let body = lines.join("\n").trim().to_string();
+            if !body.is_empty() {
+                blocks.push((n, body));
+            }
+        }
+        lines.clear();
+    }
+
+    for line in trimmed.lines() {
+        let t = line.trim();
+        if t.starts_with("## 第") {
+            let rest = t.strip_prefix("## 第").unwrap_or(t);
+            let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = num_str.parse::<i32>() {
+                flush_block(&mut blocks, current_num, &mut current_lines);
+                current_num = Some(n);
+                current_lines.push(line.to_string());
+                continue;
+            }
+        }
+        if current_num.is_some() {
+            current_lines.push(line.to_string());
+        }
+    }
+    flush_block(&mut blocks, current_num, &mut current_lines);
+
+    blocks.sort_by_key(|(n, _)| *n);
+    blocks
+        .into_iter()
+        .rev()
+        .take(limit)
+        .map(|(n, body)| format!("## 第{n}章\n{body}"))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+/// 从摘要档或前文材料构造 `[最近两章摘要档]` 段（第 2 章起使用）。
+pub fn recent_chapter_summaries_section(
+    chapter_num: i32,
+    state_documents: &HashMap<String, String>,
+    previous_materials: &[(ChapterRecord, String)],
+) -> String {
+    if chapter_num < 2 {
+        return String::new();
+    }
+    let from_doc = state_documents
+        .get("chapter_summaries.md")
+        .map(|s| extract_recent_chapter_summary_blocks(s, 2))
+        .unwrap_or_default();
+
+    let excerpt = if !from_doc.is_empty() {
+        from_doc.join("\n\n")
+    } else {
+        let tail: Vec<&(ChapterRecord, String)> = previous_materials
+            .iter()
+            .rev()
+            .take(2)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let mut lines: Vec<String> = Vec::new();
+        for (chapter, content) in tail {
+            let summary = {
+                let s = chapter.summary.trim();
+                if s.is_empty() {
+                    make_summary(content, DEFAULT_CHAPTER_SUMMARY_LIMIT)
+                } else {
+                    s.to_string()
+                }
+            };
+            let title = if chapter.title.trim().is_empty() {
+                format!("第{}章", chapter.number)
+            } else {
+                chapter.title.trim().to_string()
+            };
+            lines.push(format!("## 第{}章 {}\n- 摘要：{summary}", chapter.number, title));
+        }
+        if lines.is_empty() {
+            "（暂无前两章摘要，请严格依据上一章末尾衔接点续写）".to_string()
+        } else {
+            lines.join("\n\n")
+        }
+    };
+
+    format!("[最近两章摘要档]（必读，来自 chapter_summaries.md 或章节元数据）\n{excerpt}\n\n")
 }
 
 /// 构造「第一章正文 → 悬念钩子提取」的 (system, user) prompt（独立子任务，非阻塞主写作流）。
@@ -294,7 +512,7 @@ const PENDING_HOOKS_FOCUS_LIMIT: usize = 2000;
 
 /// 按章节号动态组合通用指导 + 开篇/连贯性层。
 pub fn get_chapter_dynamic_prompt(chapter_num: i32) -> String {
-    let common = COMMON_WRITING_GUIDE.trim();
+    let common = NARRATIVE_ENGINE_CORE.trim();
     if chapter_num <= 1 {
         format!(
             "{common}\n\n{}\n\n{}",
@@ -418,13 +636,19 @@ pub fn build_generation_prompts(
     last_chapter_end: &str,
 ) -> (String, String) {
     let chapter_num = target_chapter.number;
+    let narrative_constraints = core_narrative_constraints_section(project);
     let system_prompt = if chapter_num <= 1 {
-        "你是一名资深中文长篇小说作者。请根据已有设定创作开篇第一章：以悬念与氛围为主，不要解释创作过程。\
-输出须含标题/摘要/正文三段；正文结束后可追加一个闭合的 ```json 代码围栏用于 pending_hooks.md，除此之外不要输出解释。"
-            .to_string()
+        format!(
+            "你是一名资深中文长篇小说作者。请根据已有设定创作开篇第一章：以悬念与氛围为主，不要解释创作过程。\n\
+             {narrative_constraints}\
+             输出须含标题/摘要/正文三段；正文结束后可追加一个闭合的 ```json 代码围栏用于 pending_hooks.md，除此之外不要输出解释。"
+        )
     } else {
-        "你是一名资深中文长篇小说作者。请根据已有设定续写章节，保持人物性格、世界观、伏笔和叙事节奏一致。\
-不要解释创作过程，不要输出额外说明，只输出小说章节内容。".to_string()
+        format!(
+            "你是一名资深中文长篇小说作者。请根据已有设定续写章节，保持人物性格、世界观、伏笔和叙事节奏一致。\n\
+             {narrative_constraints}\
+             不要解释创作过程，不要输出额外说明，只输出小说章节内容。"
+        )
     };
 
     // 最近 12 章摘要
@@ -545,6 +769,13 @@ pub fn build_generation_prompts(
 
     let (seam_block, seam_rule) = chapter_seam_sections(last_chapter_end);
     let pending_hooks_section = pending_hooks_focus_section(chapter_num, state_documents);
+    let recent_summaries_section =
+        recent_chapter_summaries_section(chapter_num, state_documents, previous_materials);
+    let continuity_hard_rule = if chapter_num >= 2 {
+        CONTINUITY_SEAM_HARD_RULE
+    } else {
+        ""
+    };
     let chapter1_json_output = if chapter_num <= 1 {
         chapter1_hooks_json_output_section()
     } else {
@@ -559,6 +790,7 @@ pub fn build_generation_prompts(
 
     let user_prompt = format!(
         "请为小说《{title_label}》创作第{n}章。\n\n\
+         {narrative_constraints}\
          [创作目标]\n\
          - 目标章节：第{n}章\n\
          - 建议标题：{chapter_title_hint}\n\
@@ -575,6 +807,7 @@ pub fn build_generation_prompts(
          {atmosphere_section}\
          [前文摘要]\n{history_summary}\n\n\
          [最近章节正文节选]\n{recent_excerpt}\n\n\
+         {recent_summaries_section}\
          {seam_block}\
          {pending_hooks_section}\
          [连续性档案]\n{continuity_text}\n\n\
@@ -582,6 +815,7 @@ pub fn build_generation_prompts(
          请满足以下要求：\n\
          1. 情节必须承接前文，不能与既有设定冲突。\n\
          {seam_rule}\
+         {continuity_hard_rule}\
          2. 章节要有明显推进，不能只写重复铺垫。\n\
          {beats_rule}\
          3. 如果建议标题不合适，可以优化，但仍要符合当前情节。\n\
@@ -1282,11 +1516,58 @@ mod tests {
     }
 
     #[test]
+    fn core_narrative_constraints_includes_pov_and_style() {
+        let mut project = NovelProject::default();
+        project.pov = crate::project::NarrativePov::FirstPerson;
+        project.style_preset = crate::project::StylePreset::HardboiledDetective;
+        let s = core_narrative_constraints_section(&project);
+        assert!(s.contains("[核心叙事强制约束]"));
+        assert!(s.contains("第一人称"));
+        assert!(s.contains("冷硬派"));
+    }
+
+    #[test]
+    #[test]
+    fn build_generation_prompts_includes_core_narrative_constraints() {
+        let project = NovelProject {
+            pov: crate::project::NarrativePov::ThirdPersonLimited,
+            density: crate::project::NarrativeDensity::Medium,
+            style_preset: crate::project::StylePreset::Standard,
+            ..NovelProject::default()
+        };
+        let target = ChapterRecord {
+            number: 2,
+            title: "第二章".into(),
+            summary: String::new(),
+            status: "draft".into(),
+            word_count: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
+            beats: Vec::new(),
+            end_snapshot: String::new(),
+        };
+        let (sys, user) = build_generation_prompts(
+            &project,
+            &target,
+            &[],
+            &[],
+            "",
+            &HashMap::new(),
+            "",
+        );
+        assert!(user.contains("[核心叙事强制约束]"));
+        assert!(sys.contains("[核心叙事强制约束]"));
+        assert!(!user.contains("林夜"));
+        assert!(!user.contains("停尸房"));
+    }
+
+    #[test]
     fn get_chapter_dynamic_prompt_ch1_has_prologue() {
         let p = get_chapter_dynamic_prompt(1);
         assert!(p.contains("第一章专属创作指令"));
         assert!(p.contains("反大纲化与悬念构建"));
         assert!(p.contains("信息遮蔽原则"));
+        assert!(p.contains("信息增量"));
     }
 
     #[test]
@@ -1354,6 +1635,64 @@ mod tests {
         );
         assert!(user.contains("pending_hooks.md"));
         assert!(user.contains("第一章专属创作指令"));
+    }
+
+    #[test]
+    fn parse_chapter_context_output_parses_fence() {
+        let raw = "```json\n{\"summary\":\"主角抵达城北\",\"hooks\":[\"左眼异变\"],\"state_updates\":{\"location\":\"城北废站\",\"inventory\":\"旧罗盘\"}}\n```";
+        let r = parse_chapter_context_output(raw).unwrap();
+        assert!(r.summary.contains("城北"));
+        assert_eq!(r.hooks.len(), 1);
+        assert!(r.state_updates.location.contains("废站"));
+    }
+
+    #[test]
+    fn extract_recent_chapter_summary_blocks_takes_last_two() {
+        let md = "# 各章摘要\n\n## 第1章 开\n- 摘要：a\n\n## 第2章 中\n- 摘要：b\n\n## 第3章 末\n- 摘要：c\n";
+        let blocks = extract_recent_chapter_summary_blocks(md, 2);
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].contains("第2章"));
+        assert!(blocks[1].contains("第3章"));
+    }
+
+    #[test]
+    fn hooks_strings_to_markdown_formats_entries() {
+        let md = hooks_strings_to_pending_hooks_markdown(&["神秘短信".into()]);
+        assert!(md.contains("[线索片段]"));
+        assert!(md.contains("神秘短信"));
+    }
+
+    #[test]
+    fn build_generation_prompts_ch2_includes_recent_summaries_and_hard_rule() {
+        let project = NovelProject::default();
+        let target = ChapterRecord {
+            number: 2,
+            title: "第二章".into(),
+            summary: String::new(),
+            status: "draft".into(),
+            word_count: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
+            beats: Vec::new(),
+            end_snapshot: String::new(),
+        };
+        let mut docs = HashMap::new();
+        docs.insert(
+            "chapter_summaries.md".to_string(),
+            "## 第1章 一\n- 摘要：开篇\n\n## 第2章 二\n- 摘要：承接\n".to_string(),
+        );
+        let (_sys, user) = build_generation_prompts(
+            &project,
+            &target,
+            &[],
+            &[],
+            "",
+            &docs,
+            "她推开门。",
+        );
+        assert!(user.contains("[最近两章摘要档]"));
+        assert!(user.contains("禁止跳跃时空"));
+        assert!(user.contains("[待回收伏笔（必须推进）]"));
     }
 
     #[test]

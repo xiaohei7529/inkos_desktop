@@ -4,7 +4,57 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)。
 
-## [Unreleased]
+## [0.3.4] - 2026-05-18
+
+主题：**通用叙事框架**。将写作 Prompt 从题材硬编码（灵异/慢节奏范例）抽象为可配置的 POV、叙事密度与文风包；约束写入 `project.json` 并在生成时强制注入。
+
+### 新增
+
+- **叙事框架三件套**（`project.json` 持久化，`#[serde(default)]` 兼容旧项目）：
+  - `NarrativePov`：第一人称 / 第三人称限知（默认）/ 第三人称全知，含 `to_prompt_instruction()` 视角锁定文案。
+  - `NarrativeDensity`：低（动作推进）/ 中（平衡）/ 高（氛围沉浸），控制描写与推进比例。
+  - `StylePreset`：标准 / 冷硬派侦探 / 华丽流奇幻 / 悬疑惊悚，与剧情逻辑解耦。
+- **小说设定 → 基础信息**：在「目标章节数」上方增加 POV、叙事密度、文风包三个下拉框；保存小说资料时写入 `project.json`。
+- **新建小说向导**：同样提供上述三个下拉，新建项目即可固化叙事参数。
+- **`[核心叙事强制约束]` Prompt 块**：`inkoswin_prompt::core_narrative_constraints_section` 从项目枚举组装约束，置于章节生成 System / User Prompt 顶部。
+
+### 优化
+
+- **`NARRATIVE_ENGINE_CORE`** 替代原灵异向 `COMMON_WRITING_GUIDE`（旧常量名保留别名）：统一信息增量、实体追踪、零跳跃衔接等题材无关叙事工程规则。
+- **`get_chapter_dynamic_prompt`** 与 `build_generation_prompts` 不再注入「林夜/停尸房/左眼」等硬编码范例；开篇/连贯性专用指南（`CHAPTER_ONE_STRATEGY` 等）仍按章号保留。
+
+### 内部
+
+- `project`：`NarrativePov` / `NarrativeDensity` / `StylePreset` 及 `NovelProject::{pov,density,style_preset}`。
+- `app::ui_narrative_frame_combos`；单元测试覆盖旧 JSON 反序列化与新约束块注入。
+
+## [0.3.3] - 2026-05-18
+
+主题：**章节后置摘要 + 伏笔/状态自动同步**。写作完成后追加一次 LLM 结构化提取，用真实剧情摘要替代「首句截取」回退；续写时显式注入最近两章摘要档并强化时空/伏笔硬约束。
+
+### 新增
+
+- **后置摘要子任务（Post-Write）**：手动「生成本章」与定时写作在正文生成后自动调用 `build_extract_chapter_context_prompts`，解析 `ChapterContextReport` JSON（`summary` / `hooks` / `state_updates`），经 `apply_chapter_context_report` 落盘。
+- **结构化摘要写入**：
+  - 更新 `ChapterRecord.summary` 并本地重建 `story_state/chapter_summaries.md`。
+  - 手动生成：后置完成后覆盖摘要编辑框；定时写作：再次 `save_chapter` 写入新摘要。
+- **伏笔与状态同步**：`hooks` 增量 patch 至 `pending_hooks.md`；`state_updates.location` / `inventory` 追加至 `current_state.md` 章末快照块。
+- **续写上下文增强**（第 2 章起）：
+  - `[最近两章摘要档]`：从 `chapter_summaries.md` 解析最后两章 `## 第N章` 块，无档时回退前两章元数据摘要。
+  - `CONTINUITY_SEAM_HARD_RULE`：禁止跳跃时空，须从前章 500 字衔接点延续，并推进 1–2 条待回收悬念。
+- **写作管线 Draft**（`pipeline::build_draft_prompt`）与主写作对齐：同样注入最近两章摘要档、`pending_hooks` 必读段与连贯性硬约束。
+
+### 优化
+
+- 手动生成完成时不再用 `make_summary` 首句回退覆盖摘要（≥40 字的行内「摘要：」仍可作预览）；最终以 Post-Write 结构化摘要为准。
+- 定时写作的「章节保存后自动刷新长期记忆」延后至后置摘要完成，避免下一章读到过期 `chapter_summaries.md`。
+- 全章节统一走后置摘要路径，替代原先仅第 1 章的悬念提取子任务；第 1 章仍保留正文尾部 `StateSyncReport` JSON 优先写入 `pending_hooks.md`，Post-Write 作补全。
+
+### 内部
+
+- `inkoswin_prompt`：`ChapterContextReport`、`extract_recent_chapter_summary_blocks`、`hooks_strings_to_pending_hooks_markdown`。
+- `state_sync::apply_chapter_context_report`；`project::get_chapter_mut`。
+- `app`：`post_write_context_task` / `PostWritePending` 生命周期与 `poll_llm_tasks` 集成。
 
 ## [0.3.2] - 2026-05-17
 

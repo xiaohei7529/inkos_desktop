@@ -387,6 +387,103 @@ pub fn apply_audit_hooks_report(
     }))
 }
 
+const CHAPTER_CONTEXT_WHITELIST: &[&str] = &["pending_hooks.md", "current_state.md"];
+
+/// 后置摘要任务落盘结果。
+#[derive(Debug, Clone)]
+pub struct ChapterContextApplyResult {
+    pub summary: String,
+    pub hooks_applied: usize,
+    pub state_files_touched: usize,
+}
+
+/// 应用 [`ChapterContextReport`]：更新章节元数据摘要、重建 `chapter_summaries.md`、同步伏笔与状态。
+pub fn apply_chapter_context_report(
+    report: &crate::inkoswin_prompt::ChapterContextReport,
+    chapter_no: i32,
+    project: &mut crate::project::NovelProject,
+    store: &crate::project::ProjectStore,
+    novel_root: &Path,
+    state_dir: &Path,
+) -> Result<ChapterContextApplyResult> {
+    let summary = report.summary.trim().to_string();
+    if !summary.is_empty() {
+        if let Some(ch) = crate::project::ProjectStore::get_chapter_mut(project, chapter_no) {
+            ch.summary = summary.clone();
+        }
+    }
+
+    let summaries_body = store.build_chapter_summaries_document(project);
+    store.write_story_state_file("chapter_summaries.md", &summaries_body)?;
+
+    let mut updates: Vec<StateUpdate> = Vec::new();
+
+    let hooks_md = crate::inkoswin_prompt::hooks_strings_to_pending_hooks_markdown(&report.hooks);
+    if !hooks_md.trim().is_empty() {
+        let patch_content = format!(
+            "===REPLACE_BLOCK===\n## 核心伏笔\n\n===WITH===\n## 核心伏笔\n\n{hooks_md}\n===END==="
+        );
+        updates.push(StateUpdate {
+            file: "pending_hooks.md".to_string(),
+            action: "patch".to_string(),
+            content: patch_content,
+        });
+    }
+
+    let loc = report.state_updates.location.trim();
+    let inv = report.state_updates.inventory.trim();
+    if !loc.is_empty() || !inv.is_empty() {
+        let mut block = format!("\n\n<!-- post-write ch {chapter_no} -->\n## 章末快照（第{chapter_no}章）\n");
+        if !loc.is_empty() {
+            block.push_str(&format!("- 地点：{loc}\n"));
+        }
+        if !inv.is_empty() {
+            block.push_str(&format!("- 持物/资源：{inv}\n"));
+        }
+        updates.push(StateUpdate {
+            file: "current_state.md".to_string(),
+            action: "patch".to_string(),
+            content: format!("===REPLACE_BLOCK===\n\n===WITH===\n{block}\n===END==="),
+        });
+    }
+
+    let hooks_applied = if hooks_md.trim().is_empty() {
+        0
+    } else {
+        report.hooks.len()
+    };
+
+    let mut state_files_touched = 1usize; // chapter_summaries always rebuilt
+    if !updates.is_empty() {
+        let sync_report = StateSyncReport {
+            summary: if summary.is_empty() {
+                format!("第 {chapter_no} 章后置摘要同步")
+            } else {
+                summary.chars().take(80).collect()
+            },
+            updates,
+        };
+        let changes = apply_updates(novel_root, state_dir, &sync_report, CHAPTER_CONTEXT_WHITELIST);
+        state_files_touched = 1
+            + changes
+                .iter()
+                .filter(|c| c.new_chars != c.old_chars)
+                .count();
+    }
+
+    store.save_project(project)?;
+
+    Ok(ChapterContextApplyResult {
+        summary: if summary.is_empty() {
+            report.summary.clone()
+        } else {
+            summary
+        },
+        hooks_applied,
+        state_files_touched,
+    })
+}
+
 #[cfg(test)]
 mod prologue_hooks_tests {
     use super::*;
@@ -446,6 +543,71 @@ mod prologue_hooks_tests {
         let text = fs::read_to_string(state.join("pending_hooks.md")).unwrap();
         assert!(text.contains("戒指微微发烫"));
         assert!(text.contains("[线索片段]"));
+        let _ = fs::remove_dir_all(&novel);
+    }
+
+    #[test]
+    fn apply_chapter_context_report_updates_summaries_and_hooks() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let novel = std::env::temp_dir().join(format!(
+            "inkos_ch_ctx_{}_{}",
+            std::process::id(),
+            stamp
+        ));
+        let state = novel.join("story_state");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(
+            state.join("pending_hooks.md"),
+            "# 未闭合伏笔\n\n## 核心伏笔\n",
+        )
+        .unwrap();
+        fs::write(state.join("current_state.md"), "# 世界状态\n").unwrap();
+
+        let store = crate::project::ProjectStore::new(novel.clone());
+        let mut project = store.load_project().unwrap();
+        store.ensure_chapter(&mut project, 1, "第一章").unwrap();
+        store
+            .save_chapter(
+                &mut project,
+                1,
+                "第一章",
+                "她推开门，雨还在下。",
+                "generated",
+                "旧摘要",
+                &[],
+            )
+            .unwrap();
+
+        let report = crate::inkoswin_prompt::ChapterContextReport {
+            summary: "主角在雨中抵达旧站，左眼刺痛加剧。".into(),
+            hooks: vec!["左眼金光未解".into()],
+            state_updates: crate::inkoswin_prompt::ChapterStateUpdates {
+                location: "城北旧站".into(),
+                inventory: "破损罗盘".into(),
+            },
+        };
+        let res = apply_chapter_context_report(
+            &report,
+            1,
+            &mut project,
+            &store,
+            &novel,
+            &state,
+        )
+        .unwrap();
+        assert!(res.summary.contains("旧站"));
+        assert_eq!(res.hooks_applied, 1);
+        let ch = crate::project::ProjectStore::get_chapter(&project, 1).unwrap();
+        assert!(ch.summary.contains("旧站"));
+        let summaries = fs::read_to_string(state.join("chapter_summaries.md")).unwrap();
+        assert!(summaries.contains("旧站"));
+        let hooks = fs::read_to_string(state.join("pending_hooks.md")).unwrap();
+        assert!(hooks.contains("左眼金光"));
+        let current = fs::read_to_string(state.join("current_state.md")).unwrap();
+        assert!(current.contains("城北旧站"));
         let _ = fs::remove_dir_all(&novel);
     }
 
