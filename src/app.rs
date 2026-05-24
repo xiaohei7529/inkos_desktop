@@ -5098,6 +5098,7 @@ impl InkOsApp {
             ChatMessage::system(
                 "你是一名一线网文/小说编辑。请基于下面的项目背景、状态档案、最近一次审计意见与原文，输出**完整的改写后章节正文**：\n\
                  - 仅输出改写后的正文，不要解释、不要前言、不要代码块包裹；\n\
+                 - 不要输出或改动章节标题、章节摘要、标题行、摘要行；只改正文；\n\
                  - 优先按「最近一次审计意见」中的「问题与改进建议」逐项修复；\n\
                  - 严格遵守 book_rules.md 中的 personalityLock / behavioralConstraints / prohibitions / forbidden 列表；\n\
                  - 保持人物动机、关键事件、伏笔与原章节一致；\n\
@@ -5181,18 +5182,27 @@ impl InkOsApp {
             self.status_message = "项目未就绪，无法写入".into();
             return false;
         };
-        let (cur_title, cur_beats) = project
+        let (cur_title_meta, cur_summary, cur_beats) = project
             .chapters
             .iter()
             .find(|c| c.number == n)
-            .map(|c| (c.title.clone(), c.beats.clone()))
+            .map(|c| (c.title.clone(), c.summary.clone(), c.beats.clone()))
             .unwrap_or_default();
 
+        let (file_title, loaded_old_body) = store.load_chapter_content(n).unwrap_or_default();
+        let cur_title = if !cur_title_meta.trim().is_empty() {
+            cur_title_meta
+        } else if !file_title.trim().is_empty() {
+            file_title
+        } else {
+            format!("第{n}章")
+        };
         let old_body = if !old_body_snapshot.is_empty() {
             old_body_snapshot.to_string()
         } else {
-            store.load_chapter_content(n).map(|(_, b)| b).unwrap_or_default()
+            loaded_old_body
         };
+        let clean_rewrite_body = Self::clean_ai_rewrite_body(trimmed, &cur_title);
 
         if let Some(ref root) = novel_root {
             match history::snapshot_chapter(
@@ -5200,7 +5210,7 @@ impl InkOsApp {
                 n,
                 &cur_title,
                 &old_body,
-                trimmed,
+                &clean_rewrite_body,
                 history_kind,
                 history_detail,
             ) {
@@ -5225,7 +5235,15 @@ impl InkOsApp {
             }
         }
 
-        let save_result = store.save_chapter(project, n, &cur_title, trimmed, "review", "", &cur_beats);
+        let save_result = store.save_chapter(
+            project,
+            n,
+            &cur_title,
+            &clean_rewrite_body,
+            "review",
+            &cur_summary,
+            &cur_beats,
+        );
         match save_result {
             Ok(()) => {
                 self.status_message = if history_kind == "audit_text_rewrite" {
@@ -5241,7 +5259,7 @@ impl InkOsApp {
                 if self.selected_chapter == Some(n) {
                     self.select_chapter(n);
                 }
-                self.start_state_sync(n, &old_body, trimmed);
+                self.start_state_sync(n, &old_body, &clean_rewrite_body);
                 true
             }
             Err(e) => {
@@ -5249,6 +5267,34 @@ impl InkOsApp {
                 false
             }
         }
+    }
+
+    /// AI 改写只允许替换正文。若模型误带「标题/摘要/正文」包装，这里只取正文段，
+    /// 避免标题或章节摘要跟随改写结果被动漂移。
+    fn clean_ai_rewrite_body(raw: &str, fallback_title: &str) -> String {
+        let trimmed = raw.trim();
+        let first_non_empty = trimmed.lines().find(|line| !line.trim().is_empty()).unwrap_or("");
+        let has_generation_markers = first_non_empty.trim_start().starts_with('#')
+            || trimmed.lines().any(|line| {
+                let line = line.trim();
+                line.starts_with("标题：")
+                    || line.starts_with("标题:")
+                    || line.starts_with("摘要：")
+                    || line.starts_with("摘要:")
+                    || line == "正文"
+                    || line == "正文："
+                    || line == "正文:"
+            });
+
+        if has_generation_markers {
+            let parsed = inkoswin_prompt::parse_generation_output(trimmed, fallback_title);
+            let content = parsed.content.trim();
+            if !content.is_empty() {
+                return content.to_string();
+            }
+        }
+
+        trimmed.to_string()
     }
 
     /// 完成后从全文尾部 JSON 围栏解析程序化动作卡片。
@@ -5460,6 +5506,7 @@ impl InkOsApp {
             ChatMessage::system(
                 "你是一名一线网文/小说编辑。请基于下面的项目背景、状态档案、程序化改写指令与原文，输出**完整的改写后章节正文**：\n\
                  - 仅输出改写后的正文，不要解释、不要前言、不要代码块包裹；\n\
+                 - 不要输出或改动章节标题、章节摘要、标题行、摘要行；只改正文；\n\
                  - **严格遵照**上文「程序化改写指令」逐项修改；\n\
                  - 严格遵守 book_rules.md 中的 personalityLock / behavioralConstraints / prohibitions / forbidden 列表（若状态中可见）；\n\
                  - 保持人物动机、关键事件、伏笔与原章节一致；\n\
