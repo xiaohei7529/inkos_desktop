@@ -1152,6 +1152,109 @@ pub fn generate_init_settings_prompt(name: &str, genre: &str) -> (String, String
     (system.to_string(), user)
 }
 
+/// 新建小说向导：估算目标章节数与单章字数。
+pub fn generate_project_budget_prompt(project: &NovelProject) -> (String, String) {
+    let title = blank_or(&project.title, "未命名小说");
+    let genre = blank_or(&project.genre, "未指定");
+    let premise = blank_or(&project.premise, "未填写");
+    let protagonists = blank_or(&project.protagonists, "未填写");
+    let world = blank_or(&project.world_setting, "未填写");
+    let style = blank_or(&project.writing_style, "未填写");
+    let system = "你是一名中文长篇小说商业策划编辑。请根据题材、故事复杂度与连载节奏，估算合理的全书章节数和单章目标字数。只输出 JSON，不要解释。";
+    let user = format!(
+        "请为以下小说估算篇幅，并严格输出 JSON：\n\n\
+         - 书名：{title}\n\
+         - 类型：{genre}\n\
+         - 故事核心：{premise}\n\
+         - 主角与关键角色：{protagonists}\n\
+         - 世界观与背景：{world}\n\
+         - 文风与节奏：{style}\n\n\
+         输出格式：\n\
+         {{\"target_chapters\": 120, \"chapter_word_goal\": 3000}}\n\n\
+         约束：target_chapters 为 20-2000 的整数；chapter_word_goal 为 1000-8000 的整数。"
+    );
+    (system.to_string(), user)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProjectBudgetSuggestion {
+    pub target_chapters: i32,
+    pub chapter_word_goal: i32,
+}
+
+pub fn parse_project_budget_output(raw: &str) -> Option<ProjectBudgetSuggestion> {
+    let cleaned = strip_outer_md_fence(raw.trim());
+    let slice = if let (Some(start), Some(end)) = (cleaned.find('{'), cleaned.rfind('}')) {
+        &cleaned[start..=end]
+    } else {
+        cleaned.trim()
+    };
+    let v: serde_json::Value = serde_json::from_str(slice).ok()?;
+    let chapters = v.get("target_chapters")?.as_i64()? as i32;
+    let words = v.get("chapter_word_goal")?.as_i64()? as i32;
+    Some(ProjectBudgetSuggestion {
+        target_chapters: chapters.clamp(20, 2000),
+        chapter_word_goal: words.clamp(1000, 8000),
+    })
+}
+
+/// 新建小说向导：按目标章节数生成可写入 `story_state/outline.md` 的完整大纲。
+pub fn generate_outline_prompt(project: &NovelProject) -> (String, String) {
+    let title = blank_or(&project.title, "未命名小说");
+    let genre = blank_or(&project.genre, "未指定");
+    let premise = blank_or(&project.premise, "未填写");
+    let protagonists = blank_or(&project.protagonists, "未填写");
+    let world = blank_or(&project.world_setting, "未填写");
+    let style = blank_or(&project.writing_style, "未填写");
+    let chapters = project.target_chapters.max(1);
+    let words = project.chapter_word_goal.max(500);
+    let system = "你是一名中文长篇小说总编剧，擅长把全书目标拆成宏观大纲、分卷/阶段大纲与章节级细纲。只输出 Markdown 正文，不要代码围栏，不要解释。";
+    let user = format!(
+        "请为小说《{title}》生成 `outline.md`，写作时会作为长期状态档案注入 prompt。\n\n\
+         [项目信息]\n\
+         - 类型：{genre}\n\
+         - 目标章节数：{chapters} 章\n\
+         - 目标字/章：{words} 字\n\
+         - 故事核心：{premise}\n\
+         - 主角与关键角色：{protagonists}\n\
+         - 世界观与背景：{world}\n\
+         - 文风与节奏：{style}\n\n\
+         [输出结构]\n\
+         # 书籍大纲\n\n\
+         ## 故事大纲（宏观）\n\
+         写清起因、发展、高潮、结局、主线冲突与主题承诺。\n\n\
+         ## 分卷 / 阶段大纲\n\
+         按目标章节数切成 3-8 个阶段或分卷。每个阶段必须写明：章节范围、核心目标、主要矛盾、情感弧线、阶段钩子。\n\n\
+         ## 细纲（章节级规划）\n\
+         必须覆盖第1章到第{chapters}章。每章用 1 行或短条目，格式尽量统一：\n\
+         ### 第N章 标题\n\
+         - 场景：...\n\
+         - 出场人物：...\n\
+         - 核心事件：...\n\
+         - 情绪/节奏：...\n\
+         - 钩子/伏笔：...\n\n\
+         [硬性要求]\n\
+         - 不要写“待补充”。\n\
+         - 细纲必须与目标章节数一致，不能只写前几章。\n\
+         - 允许章节级规划简洁，但每章必须有可执行的剧情推进点。\n\
+         - 不要输出 Markdown 代码围栏。"
+    );
+    (system.to_string(), user)
+}
+
+pub fn parse_outline_output(raw: &str) -> String {
+    let cleaned = strip_outer_md_fence(raw.trim());
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.starts_with("# 书籍大纲") {
+        trimmed.to_string()
+    } else {
+        format!("# 书籍大纲\n\n{trimmed}")
+    }
+}
+
 fn init_bracket_header_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -1962,5 +2065,21 @@ mod tests {
         assert_eq!(p.protagonists, "张三");
         assert_eq!(p.world_setting, "架空");
         assert_eq!(p.writing_style, "快");
+    }
+
+    #[test]
+    fn parse_project_budget_output_reads_json_fence() {
+        let raw = "```json\n{\"target_chapters\": 180, \"chapter_word_goal\": 3200}\n```";
+        let p = parse_project_budget_output(raw).unwrap();
+        assert_eq!(p.target_chapters, 180);
+        assert_eq!(p.chapter_word_goal, 3200);
+    }
+
+    #[test]
+    fn parse_outline_output_adds_title_when_missing() {
+        let raw = "## 故事大纲（宏观）\n主角踏入旧城。";
+        let out = parse_outline_output(raw);
+        assert!(out.starts_with("# 书籍大纲"));
+        assert!(out.contains("旧城"));
     }
 }

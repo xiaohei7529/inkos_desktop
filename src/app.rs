@@ -408,6 +408,14 @@ pub struct InkOsApp {
     wizard_project: NovelProject,
     /// 新建小说向导「AI 灵感生成」LLM 任务
     wizard_init_settings_task: Option<LlmTask>,
+    /// 新建小说向导「AI 估算篇幅」LLM 任务
+    wizard_budget_task: Option<LlmTask>,
+    /// 新建小说向导「AI 生成 outline.md」LLM 任务
+    wizard_outline_task: Option<LlmTask>,
+    /// 点击创建后，等待 outline.md 生成完成再真正落盘。
+    wizard_create_after_outline: bool,
+    /// outline.md 预生成结果，创建时写入 story_state/outline.md。
+    wizard_outline_draft: String,
 }
 
 impl InkOsApp {
@@ -515,7 +523,7 @@ impl InkOsApp {
             pending_hooks_summary: Vec::new(),
             pending_hooks_mtime: None,
             pending_hooks_collapsed: false,
-            context_radar_collapsed: false,
+            context_radar_collapsed: true,
             hooks_tracker_open: false,
             edit_vendor_id: None,
             edit_vendor_buf: VendorConfig::default(),
@@ -573,6 +581,10 @@ impl InkOsApp {
             wizard_dir: String::new(),
             wizard_project: NovelProject::default(),
             wizard_init_settings_task: None,
+            wizard_budget_task: None,
+            wizard_outline_task: None,
+            wizard_create_after_outline: false,
+            wizard_outline_draft: String::new(),
         };
 
         if !app.settings.default_novel_path.is_empty() {
@@ -746,7 +758,7 @@ impl InkOsApp {
         self.selected_chapter = Some(n);
         match store.load_chapter_content(n) {
             Ok((t, b)) => {
-                self.chapter_title = t;
+                self.chapter_title = self.resolve_chapter_title(n, &t);
                 self.chapter_body = b;
                 if let Some(ref p) = self.project {
                     if let Some(rec) = p.chapters.iter().find(|c| c.number == n) {
@@ -767,6 +779,35 @@ impl InkOsApp {
             }
             Err(e) => self.status_message = format!("读取章节失败：{e}"),
         }
+    }
+
+    fn resolve_chapter_title(&self, n: i32, preferred: &str) -> String {
+        let title = preferred.trim();
+        if !title.is_empty() && !Self::is_generic_chapter_title(n, title) {
+            return title.to_string();
+        }
+        let record_title = self
+            .project
+            .as_ref()
+            .and_then(|p| p.chapters.iter().find(|c| c.number == n))
+            .map(|c| c.title.trim())
+            .filter(|t| !t.is_empty())
+            .map(str::to_string);
+        if let Some(record_title) = record_title {
+            if !Self::is_generic_chapter_title(n, &record_title) {
+                return record_title;
+            }
+        }
+        if !title.is_empty() {
+            title.to_string()
+        } else {
+            format!("第{n}章")
+        }
+    }
+
+    fn is_generic_chapter_title(n: i32, title: &str) -> bool {
+        let compact = title.split_whitespace().collect::<String>();
+        compact == format!("第{n}章")
     }
 
     fn save_current_chapter(&mut self) {
@@ -1764,18 +1805,21 @@ impl InkOsApp {
             if let Some(raw) = stream_snapshot {
                 // 流式预览也用 inkoswin 解析器；这样「标题：/摘要：/正文：」格式能在一开始就把
                 // 标题与摘要及时展示出来，正文部分逐步填充。
-                let fallback_title = if !self.chapter_title.trim().is_empty() {
-                    self.chapter_title.clone()
-                } else if let Some(n) = self.manual_gen_target {
-                    format!("第{n}章")
-                } else {
-                    String::new()
-                };
+                let fallback_title = self
+                    .manual_gen_target
+                    .map(|n| self.resolve_chapter_title(n, &self.chapter_title))
+                    .unwrap_or_else(|| self.chapter_title.trim().to_string());
                 let result = inkoswin_prompt::parse_generation_output(raw.trim(), &fallback_title);
-                if !result.title.trim().is_empty() {
+                if !result.title.trim().is_empty()
+                    && (result.title.trim() != fallback_title.trim()
+                        || self.chapter_title.trim().is_empty())
+                {
                     self.chapter_title = result.title;
                 }
-                self.chapter_body = result.content;
+                if self.chapter_body != result.content {
+                    self.chapter_body = result.content;
+                    self.chapter_dirty = true;
+                }
                 // 流式阶段的摘要只做预览，不覆盖用户未保存摘要（避免抖动）；完成时再一次性写入。
                 self.preview_md = self.chapter_body.clone();
             }
@@ -1849,6 +1893,56 @@ impl InkOsApp {
                         format!("✓  已获取 {} 个模型（点击列表项填入「默认模型」）", self.vendor_models_list.len());
                 }
                 self.vendor_models_task = None;
+            } else {
+                any_running = true;
+            }
+        }
+        if let Some(task) = &mut self.wizard_budget_task {
+            task.drain();
+            if task.done {
+                let acc = task.accumulated.clone();
+                let err = task.error.clone();
+                self.wizard_budget_task = None;
+                if let Some(e) = err {
+                    self.status_message = format!("AI 估算篇幅失败：{e}");
+                } else if let Some(s) = inkoswin_prompt::parse_project_budget_output(&acc) {
+                    self.wizard_project.target_chapters = s.target_chapters;
+                    self.wizard_project.chapter_word_goal = s.chapter_word_goal;
+                    self.status_message = format!(
+                        "AI 已估算篇幅：{} 章 · {} 字/章",
+                        s.target_chapters, s.chapter_word_goal
+                    );
+                } else {
+                    self.status_message = "AI 估算篇幅完成，但未能解析章节数与字数。".into();
+                }
+            } else {
+                any_running = true;
+            }
+        }
+        if let Some(task) = &mut self.wizard_outline_task {
+            task.drain();
+            if task.done {
+                let acc = task.accumulated.clone();
+                let err = task.error.clone();
+                self.wizard_outline_task = None;
+                if let Some(e) = err {
+                    self.wizard_create_after_outline = false;
+                    self.status_message = format!("AI 生成书籍大纲失败：{e}");
+                } else {
+                    let outline = inkoswin_prompt::parse_outline_output(&acc);
+                    if outline.trim().is_empty() {
+                        self.wizard_create_after_outline = false;
+                        self.status_message = "AI 生成书籍大纲完成，但响应为空。".into();
+                    } else {
+                        self.wizard_outline_draft = outline;
+                        if self.wizard_create_after_outline {
+                            self.wizard_create_after_outline = false;
+                            self.finish_create_wizard_novel();
+                        } else {
+                            self.status_message = "AI 已生成书籍大纲，创建小说档案时会写入 outline.md。".into();
+                        }
+                    }
+                }
             } else {
                 any_running = true;
             }
@@ -2182,6 +2276,10 @@ impl InkOsApp {
                     {
                         self.wizard_project = NovelProject::default();
                         self.wizard_dir.clear();
+                        self.wizard_budget_task = None;
+                        self.wizard_outline_task = None;
+                        self.wizard_create_after_outline = false;
+                        self.wizard_outline_draft.clear();
                         self.novel_wizard_open = true;
                     }
                 });
@@ -2933,32 +3031,23 @@ impl InkOsApp {
 
         theme::card_frame().show(ui, |ui| {
             ui.horizontal(|ui| {
+                let label = if self.context_radar_collapsed {
+                    "▸ 展开"
+                } else {
+                    "▾ 折叠"
+                };
+                if ui.small_button(label).clicked() {
+                    self.context_radar_collapsed = !self.context_radar_collapsed;
+                }
+                ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new("📡 当前激活上下文")
                         .color(theme::color::TEXT)
                         .strong()
                         .size(14.0),
                 );
-                ui.label(
-                    egui::RichText::new("（按本章节拍过滤；点击可展开全量档案）")
-                        .color(theme::color::TEXT_DIM)
-                        .size(11.5),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let label = if self.context_radar_collapsed {
-                        "▸ 展开"
-                    } else {
-                        "▾ 折叠"
-                    };
-                    if ui.small_button(label).clicked() {
-                        self.context_radar_collapsed = !self.context_radar_collapsed;
-                    }
-                });
             });
-
-            if self.context_radar_collapsed {
-                return;
-            }
+            theme::dim_label(ui, "按本章节拍过滤；展开后查看实际注入 AI 上下文的档案。");
 
             let Some(docs) = docs_opt else {
                 theme::dim_label(ui, "（未打开项目或档案加载失败）");
@@ -2974,42 +3063,69 @@ impl InkOsApp {
             names.sort();
 
             ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                ui.spacing_mut().item_spacing.y = 6.0;
-                if names.is_empty() {
-                    theme::dim_label(ui, "（无可用档案）");
-                } else {
-                    for name in names {
-                        let title = crate::state_refresh::spec_for(name)
-                            .map(|s| s.title)
-                            .unwrap_or(name.as_str());
-                        let body = filtered.get(name).map(String::as_str).unwrap_or("");
-                        let preview: String = body
-                            .trim()
-                            .chars()
-                            .take(200)
-                            .collect::<String>();
-                        let pill_text = format!("{name} · {title}");
-                        let resp = egui::Frame::default()
-                            .fill(theme::color::SURFACE_HI)
-                            .stroke(Stroke::new(1.0, theme::color::BORDER_HI))
-                            .corner_radius(CornerRadius::same(255))
-                            .inner_margin(Margin::symmetric(10, 4))
-                            .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new(&pill_text)
-                                        .color(theme::color::TEXT)
-                                        .size(11.5),
-                                );
-                            });
-                        let r = resp.response.interact(egui::Sense::hover());
-                        if !preview.is_empty() {
-                            r.on_hover_text(preview);
+            if !self.context_radar_collapsed {
+                egui::ScrollArea::vertical()
+                    .id_salt("context_radar_files")
+                    .max_height(118.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        if names.is_empty() {
+                            theme::dim_label(ui, "（无可用档案）");
+                        } else {
+                            for name in &names {
+                                let title = crate::state_refresh::spec_for(name)
+                                    .map(|s| s.title)
+                                    .unwrap_or(name.as_str());
+                                let body = filtered.get(*name).map(String::as_str).unwrap_or("");
+                                let preview: String =
+                                    body.trim().chars().take(200).collect::<String>();
+                                let resp = egui::Frame::default()
+                                    .fill(theme::color::SURFACE_HI)
+                                    .stroke(Stroke::new(1.0, theme::color::BORDER_HI))
+                                    .corner_radius(CornerRadius::same(6))
+                                    .inner_margin(Margin::symmetric(10, 5))
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(name.as_str())
+                                                    .color(theme::color::TEXT)
+                                                    .size(11.5)
+                                                    .strong(),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(title)
+                                                    .color(theme::color::TEXT_DIM)
+                                                    .size(11.5),
+                                            );
+                                        });
+                                    });
+                                let r = resp.response.interact(egui::Sense::hover());
+                                if !preview.is_empty() {
+                                    r.on_hover_text(preview);
+                                }
+                                ui.add_space(4.0);
+                            }
                         }
-                    }
-                }
-            });
+                    });
+            } else if active_count > 0 {
+                let preview_names = names
+                    .iter()
+                    .take(4)
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join("、");
+                theme::dim_label(
+                    ui,
+                    &format!(
+                        "已折叠：{active_count}/{total_count} 个档案将注入上下文（{preview_names}{}）。",
+                        if active_count > 4 { "…" } else { "" }
+                    ),
+                );
+            } else {
+                theme::dim_label(ui, "已折叠：暂无可用档案。");
+            }
 
             ui.add_space(6.0);
             let foot = if beats.is_empty() {
@@ -3383,7 +3499,10 @@ impl InkOsApp {
     }
 
     fn try_start_wizard_init_settings(&mut self) {
-        if self.wizard_init_settings_task.is_some() {
+        if self.wizard_init_settings_task.is_some()
+            || self.wizard_budget_task.is_some()
+            || self.wizard_outline_task.is_some()
+        {
             return;
         }
         let title = self.wizard_project.title.trim();
@@ -3422,6 +3541,113 @@ impl InkOsApp {
         self.status_message = "AI 正在构思宏大世界观…".into();
     }
 
+    fn wizard_writing_llm(&mut self) -> Option<(VendorConfig, String, String)> {
+        let vendor_id = self.settings.writing_vendor.clone();
+        if vendor_id.is_empty() {
+            self.status_message = "请先在「设置」中选择写作 LLM 服务商。".into();
+            return None;
+        }
+        let Some(cfg) = self.vendor_config(&vendor_id) else {
+            self.status_message = "写作 LLM 服务商配置不存在。".into();
+            return None;
+        };
+        if !cfg.is_configured() {
+            self.status_message = "所选写作服务商未完整配置。".into();
+            return None;
+        }
+        let model = cfg.model.trim().to_string();
+        if model.is_empty() {
+            self.status_message = "请为写作服务商设置默认模型。".into();
+            return None;
+        }
+        Some((cfg, vendor_id, model))
+    }
+
+    fn try_start_wizard_budget(&mut self) {
+        if self.wizard_init_settings_task.is_some()
+            || self.wizard_budget_task.is_some()
+            || self.wizard_outline_task.is_some()
+        {
+            return;
+        }
+        if self.wizard_project.title.trim().is_empty()
+            || self.wizard_project.genre.trim().is_empty()
+            || self.wizard_project.premise.trim().is_empty()
+        {
+            self.status_message = "请先填写标题、小说类型和故事核心，再估算篇幅。".into();
+            return;
+        }
+        let Some((cfg, vendor_id, model)) = self.wizard_writing_llm() else {
+            return;
+        };
+        let (system, user) = inkoswin_prompt::generate_project_budget_prompt(&self.wizard_project);
+        let messages = vec![ChatMessage::system(system), ChatMessage::user(user)];
+        self.wizard_budget_task = Some(spawn_chat(cfg, vendor_id, model, messages, false));
+        self.status_message = "AI 正在估算目标章节数与目标字/章…".into();
+    }
+
+    fn try_start_wizard_outline(&mut self, create_after_done: bool) {
+        if self.wizard_init_settings_task.is_some()
+            || self.wizard_budget_task.is_some()
+            || self.wizard_outline_task.is_some()
+        {
+            return;
+        }
+        if self.wizard_project.title.trim().is_empty()
+            || self.wizard_project.genre.trim().is_empty()
+            || self.wizard_project.premise.trim().is_empty()
+        {
+            self.status_message = "请先填写标题、小说类型和故事核心，再生成书籍大纲。".into();
+            return;
+        }
+        let Some((cfg, vendor_id, model)) = self.wizard_writing_llm() else {
+            return;
+        };
+        let (system, user) = inkoswin_prompt::generate_outline_prompt(&self.wizard_project);
+        let messages = vec![ChatMessage::system(system), ChatMessage::user(user)];
+        self.wizard_create_after_outline = create_after_done;
+        self.wizard_outline_task = Some(spawn_chat(cfg, vendor_id, model, messages, false));
+        self.status_message = if create_after_done {
+            "AI 正在生成 outline.md，完成后会自动创建小说档案…".into()
+        } else {
+            "AI 正在生成书籍大纲 outline.md…".into()
+        };
+    }
+
+    fn finish_create_wizard_novel(&mut self) {
+        let dir = std::path::PathBuf::from(&self.wizard_dir);
+        if let Err(e) = crate::project::validate_new_project_dir(&dir) {
+            self.status_message = format!("创建失败：{e}");
+            return;
+        }
+        let store = crate::project::ProjectStore::new(dir.clone());
+        let mut project = self.wizard_project.clone();
+        match store.save_project(&mut project) {
+            Ok(()) => {
+                let outline = self.wizard_outline_draft.trim();
+                if !outline.is_empty() {
+                    if let Err(e) = store.write_story_state_file("outline.md", outline) {
+                        self.status_message = format!("创建成功，但写入 outline.md 失败：{e}");
+                        return;
+                    }
+                }
+                self.novel_wizard_open = false;
+                if let Err(e) = self.load_novel_dir(dir) {
+                    self.status_message = format!("创建成功但加载失败：{e}");
+                } else {
+                    self.section = Section::NovelMeta;
+                    self.status_message = format!(
+                        "已创建小说《{}》，并生成书籍大纲 outline.md。",
+                        self.wizard_project.title.trim()
+                    );
+                }
+            }
+            Err(e) => {
+                self.status_message = format!("创建失败：{e}");
+            }
+        }
+    }
+
     fn show_novel_wizard(&mut self, ctx: &egui::Context) {
         if !self.novel_wizard_open {
             return;
@@ -3435,6 +3661,8 @@ impl InkOsApp {
         let mut want_create = false;
         let mut want_pick_dir = false;
         let mut want_generate_init = false;
+        let mut want_generate_budget = false;
+        let mut want_generate_outline = false;
 
         egui::Window::new("✨  新建小说")
             .id(egui::Id::new("novel_wizard_window"))
@@ -3563,8 +3791,15 @@ impl InkOsApp {
                         && title_ok
                         && genre_ok
                         && !self.wizard_project.premise.trim().is_empty();
-                    let busy = self.wizard_init_settings_task.is_some();
+                    let busy = self.wizard_init_settings_task.is_some()
+                        || self.wizard_budget_task.is_some()
+                        || self.wizard_outline_task.is_some();
                     let can_ai = title_ok && genre_ok && !busy;
+                    let can_budget = title_ok
+                        && genre_ok
+                        && !self.wizard_project.premise.trim().is_empty()
+                        && !busy;
+                    let has_outline = !self.wizard_outline_draft.trim().is_empty();
 
                     ui.add_enabled_ui(can_ai, |ui| {
                         if ui
@@ -3577,12 +3812,35 @@ impl InkOsApp {
                             want_generate_init = true;
                         }
                     });
+                    ui.add_enabled_ui(can_budget, |ui| {
+                        if ui
+                            .button(RichText::new("AI 估算篇幅").strong())
+                            .on_hover_text("基于当前设定估算目标章节数与目标字/章，并填入上方数值框。")
+                            .clicked()
+                        {
+                            want_generate_budget = true;
+                        }
+                    });
+                    ui.add_enabled_ui(can_budget, |ui| {
+                        if ui
+                            .button(if has_outline { "重生成大纲" } else { "生成大纲" })
+                            .on_hover_text("按目标章节数生成 story_state/outline.md：宏观大纲、分卷/阶段大纲、章节级细纲。")
+                            .clicked()
+                        {
+                            want_generate_outline = true;
+                        }
+                    });
                     if busy {
-                        ui.label(
-                            RichText::new("AI 正在构思宏大世界观…")
-                                .color(color::ACCENT_HI)
-                                .italics(),
-                        );
+                        let busy_text = if self.wizard_budget_task.is_some() {
+                            "AI 正在估算篇幅…"
+                        } else if self.wizard_outline_task.is_some() {
+                            "AI 正在生成书籍大纲…"
+                        } else {
+                            "AI 正在构思宏大世界观…"
+                        };
+                        ui.label(RichText::new(busy_text).color(color::ACCENT_HI).italics());
+                    } else if has_outline {
+                        ui.label(RichText::new("outline.md 已预生成").color(color::ACCENT));
                     }
                     ui.add_enabled_ui(can_create, |ui| {
                         if ui.button(RichText::new("🚀  创建小说档案").strong()).clicked() {
@@ -3611,30 +3869,19 @@ impl InkOsApp {
             self.try_start_wizard_init_settings();
         }
 
+        if want_generate_budget {
+            self.try_start_wizard_budget();
+        }
+
+        if want_generate_outline {
+            self.try_start_wizard_outline(false);
+        }
+
         if want_create {
-            let dir = std::path::PathBuf::from(&self.wizard_dir);
-            if let Err(e) = crate::project::validate_new_project_dir(&dir) {
-                self.status_message = format!("创建失败：{e}");
-                return;
-            }
-            let store = crate::project::ProjectStore::new(dir.clone());
-            let mut project = self.wizard_project.clone();
-            match store.save_project(&mut project) {
-                Ok(()) => {
-                    self.novel_wizard_open = false;
-                    if let Err(e) = self.load_novel_dir(dir) {
-                        self.status_message = format!("创建成功但加载失败：{e}");
-                    } else {
-                        self.section = Section::NovelMeta;
-                        self.status_message = format!(
-                            "已创建小说《{}》，并初始化本地状态档案模板。",
-                            self.wizard_project.title.trim()
-                        );
-                    }
-                }
-                Err(e) => {
-                    self.status_message = format!("创建失败：{e}");
-                }
+            if self.wizard_outline_draft.trim().is_empty() {
+                self.try_start_wizard_outline(true);
+            } else {
+                self.finish_create_wizard_novel();
             }
         }
 
@@ -6876,11 +7123,7 @@ impl InkOsApp {
         }
 
         // 对齐 inkoswin：优先按「标题：/摘要：/正文：」解析，fallback 到 `#` 首行。
-        let fallback_title = if !self.chapter_title.trim().is_empty() {
-            self.chapter_title.trim().to_string()
-        } else {
-            format!("第{target_n}章")
-        };
+        let fallback_title = self.resolve_chapter_title(target_n, &self.chapter_title);
         let result = inkoswin_prompt::parse_generation_output(&raw, &fallback_title);
 
         let mut hooks_sync_note = String::new();
@@ -6922,7 +7165,7 @@ impl InkOsApp {
             }
         }
 
-        self.chapter_title = result.title.clone();
+        self.chapter_title = self.resolve_chapter_title(target_n, &result.title);
         self.chapter_body = result.content.clone();
         // 摘要：若 LLM 给出，则写入摘要编辑框并标记为 dirty 供用户一并保存；
         // 否则保留原摘要（parse_generation_output 已在 fallback 场景自动生成 make_summary）。
@@ -6950,9 +7193,10 @@ impl InkOsApp {
             &format!("第 {target_n} 章 · {words} 字"),
         );
 
+        let post_write_title = self.chapter_title.clone();
         self.start_post_write_context_task(
             target_n,
-            &result.title,
+            &post_write_title,
             &result.content,
             false,
             false,
@@ -7233,12 +7477,12 @@ impl InkOsApp {
                     }
                 }
 
-                let fallback_title = format!("第{n}章");
+                let fallback_title = self.resolve_chapter_title(n, "");
                 let result = inkoswin_prompt::parse_generation_output(&raw, &fallback_title);
                 let title = if result.title.trim().is_empty() {
                     fallback_title
                 } else {
-                    result.title.trim().to_string()
+                    self.resolve_chapter_title(n, &result.title)
                 };
                 let body = result.content;
                 let summary = self.normalize_generated_summary(&result.summary, &body);

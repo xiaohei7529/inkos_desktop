@@ -10,6 +10,9 @@ use serde_json::Value;
 
 use crate::config::VendorConfig;
 
+const HTTP_TIMEOUT_SECS: u64 = 300;
+const STREAM_IDLE_TIMEOUT_SECS: u64 = 90;
+
 #[derive(Clone, Debug)]
 pub struct ChatMessage {
     pub role: String,
@@ -46,6 +49,7 @@ pub struct LlmTask {
     pub model: String,
     pub streaming: bool,
     pub started_at: Instant,
+    pub last_event_at: Instant,
     pub elapsed_when_done: Option<Duration>,
 }
 
@@ -58,7 +62,10 @@ impl LlmTask {
                 Ok(ev) => {
                     updated = true;
                     match ev {
-                        LlmEvent::Delta(s) => self.accumulated.push_str(&s),
+                        LlmEvent::Delta(s) => {
+                            self.last_event_at = Instant::now();
+                            self.accumulated.push_str(&s);
+                        }
                         LlmEvent::Done => {
                             if !self.done {
                                 self.elapsed_when_done = Some(self.started_at.elapsed());
@@ -74,8 +81,29 @@ impl LlmTask {
                         }
                     }
                 }
-                Err(_) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if !self.done {
+                        self.elapsed_when_done = Some(self.started_at.elapsed());
+                        self.error = Some("请求线程已结束，但没有收到完成信号".into());
+                        self.done = true;
+                        updated = true;
+                    }
+                    break;
+                }
             }
+        }
+        if !self.done
+            && self.streaming
+            && !self.accumulated.trim().is_empty()
+            && self.last_event_at.elapsed() > Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS)
+        {
+            self.elapsed_when_done = Some(self.started_at.elapsed());
+            self.error = Some(format!(
+                "流式输出中断：超过 {STREAM_IDLE_TIMEOUT_SECS} 秒没有收到新内容，已保留当前已生成文本"
+            ));
+            self.done = true;
+            updated = true;
         }
         updated
     }
@@ -208,6 +236,7 @@ pub fn spawn_chat(
         model: m_id,
         streaming,
         started_at: Instant::now(),
+        last_event_at: Instant::now(),
         elapsed_when_done: None,
     }
 }
@@ -261,6 +290,7 @@ pub fn spawn_generate_init_settings(
         model: m_id,
         streaming: false,
         started_at: Instant::now(),
+        last_event_at: Instant::now(),
         elapsed_when_done: None,
     }
 }
@@ -400,7 +430,7 @@ fn parse_models_json(txt: &str) -> Result<Vec<String>, String> {
 
 fn build_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(180))
+        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
         .build()
 }
 
